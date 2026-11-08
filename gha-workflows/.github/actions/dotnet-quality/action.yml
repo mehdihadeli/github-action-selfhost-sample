@@ -1,0 +1,70 @@
+name: .NET code quality
+description: Check dotnet style, CSharpier formatting, and Roslyn analyzer diagnostics without modifying source.
+inputs:
+  project:
+    description: Restored project or solution path; run dotnet-setup first.
+    required: true
+  configuration:
+    description: Build configuration for compiler and analyzer validation.
+    default: Release
+  csharpier-directory:
+    description: Directory to check; defaults to the project or solution directory.
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Verify dotnet code style
+      id: style
+      shell: bash
+      env:
+        PROJECT: ${{ inputs.project }}
+      run: dotnet format style "$PROJECT" --verify-no-changes --no-restore
+    - name: Verify CSharpier formatting
+      id: csharpier
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        PROJECT: ${{ inputs.project }}
+        CSHARPIER_DIRECTORY: ${{ inputs.csharpier-directory }}
+      run: |
+        set -euo pipefail
+        target="${CSHARPIER_DIRECTORY:-$(dirname "$PROJECT")}"
+        if [[ ! -d "$target" ]]; then
+          echo "CSharpier directory does not exist: $target" >&2
+          exit 1
+        fi
+        tool_directory="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/csharpier.XXXXXX")"
+        trap 'rm -rf -- "$tool_directory"' EXIT
+        dotnet tool install csharpier --tool-path "$tool_directory"
+        "$tool_directory/csharpier" check "$target"
+    - name: Verify Roslyn analyzer fixes
+      id: analyzers
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        PROJECT: ${{ inputs.project }}
+      run: dotnet format analyzers "$PROJECT" --verify-no-changes --no-restore --severity warn
+    - name: Enforce compiler and Roslyn diagnostics
+      id: diagnostics
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        PROJECT: ${{ inputs.project }}
+        CONFIGURATION: ${{ inputs.configuration }}
+      run: |
+        dotnet build "$PROJECT" --no-restore --no-incremental --configuration "$CONFIGURATION" \
+          -p:EnableNETAnalyzers=true \
+          -p:RunAnalyzers=true \
+          -p:RunAnalyzersDuringBuild=true \
+          -p:EnforceCodeStyleInBuild=true \
+          -p:TreatWarningsAsErrors=true
+    - name: Record Code Quality Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 🧹 .NET Code Quality
+        tool: dotnet format / CSharpier / Roslyn
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: style,csharpier,analyzers,diagnostics
+        job-status: ${{ job.status }}
+        details: 'Verify code style and formatting; fail on compiler and enabled analyzer warnings or errors.'

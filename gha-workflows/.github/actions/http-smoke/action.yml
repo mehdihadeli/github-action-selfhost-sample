@@ -1,0 +1,57 @@
+name: Deployed HTTP and JSON smoke
+description: Validate health plus a non-empty JSON API response after exact-revision reconciliation.
+inputs:
+  url:
+    description: Application base URL reachable from the runner.
+    required: true
+  health-path:
+    default: /health
+    description: Health endpoint returning HTTP 200.
+  api-path:
+    default: /weatherforecast
+    description: API endpoint returning JSON.
+  json-kind:
+    default: array
+    description: array or object; must be non-empty.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      id: smoke
+      env:
+        URL: ${{ inputs.url }}
+        HEALTH_PATH: ${{ inputs.health-path }}
+        API_PATH: ${{ inputs.api-path }}
+        JSON_KIND: ${{ inputs.json-kind }}
+      run: |
+        [[ "$URL" == http://* || "$URL" == https://* ]]
+        [[ "$HEALTH_PATH" == /* && "$API_PATH" == /* ]]
+        mkdir -p artifacts/runtime
+        health="$(curl --silent --show-error --max-time 30 --output artifacts/runtime/health.txt \
+          --write-out '%{http_code}' "${URL%/}$HEALTH_PATH")"
+        [[ "$health" == 200 ]]
+        api="$(curl --silent --show-error --max-time 30 --dump-header artifacts/runtime/headers.txt \
+          --output artifacts/runtime/response.json --write-out '%{http_code}' "${URL%/}$API_PATH")"
+        [[ "$api" == 200 ]]
+        python3 - <<'PY'
+        import json, os, pathlib
+        headers = pathlib.Path('artifacts/runtime/headers.txt').read_text().lower()
+        if 'content-type: application/json' not in headers:
+            raise SystemExit('API must return application/json.')
+        payload = json.loads(pathlib.Path('artifacts/runtime/response.json').read_text())
+        expected = {'array': list, 'object': dict}.get(os.environ['JSON_KIND'])
+        if expected is None or not isinstance(payload, expected) or not payload:
+            raise SystemExit('API JSON shape must match configuration and be non-empty.')
+        print('Health HTTP 200 and non-empty API JSON validated.')
+        PY
+    - name: Record HTTP Smoke Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 🌐 Deployed HTTP Smoke
+        tool: curl and JSON validation
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: smoke
+        success-label: VERIFIED
+        job-status: ${{ job.status }}
+        details: 'Require healthy HTTP response and the configured non-empty API JSON shape.'

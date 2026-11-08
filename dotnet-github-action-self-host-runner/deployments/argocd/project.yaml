@@ -1,0 +1,27 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: simple-api
+  namespace: argocd
+spec:
+  description: Deploy only the SimpleApi workload from the local GitOps repository.
+  sourceRepos:
+    - http://gitea.gitops-system.svc.cluster.local:3000/admin/simple-api-gitops.git
+  destinations:
+    - namespace: simple-api
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist: []
+  roles:
+    - name: ci-observer
+      description: Read only this application's reconciliation state.
+      policies:
+        - p, proj:simple-api:ci-observer, applications, get, simple-api/simple-api-local, allow
+  namespaceResourceWhitelist:
+    - group: apps
+      kind: Deployment
+    - group: ''
+      kind: Service
+    - group: networking.k8s.io
+      kind: Ingress
+    - group: networking.k8s.io
+      kind: NetworkPolicy

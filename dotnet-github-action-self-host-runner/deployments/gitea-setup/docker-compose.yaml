@@ -1,0 +1,55 @@
+name: gitea
+
+networks:
+  gitea:
+    external: false
+
+services:
+  server:
+    image: docker.gitea.com/gitea:28.3.0
+    container_name: gitea
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+      - GITEA__actions__ENABLED=true
+    restart: always
+    networks:
+      - gitea
+    volumes:
+      - gitea-data:/data
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "3000:3000"
+      - "222:22"
+
+  runner:
+    profiles: [actions]
+    build:
+      context: ../local
+      dockerfile: gitea-runner.Dockerfile
+    image: local-gitea-dotnet-runner:10.0
+    container_name: gitea-dotnet-runner
+    privileged: true
+    restart: unless-stopped
+    depends_on:
+      - server
+    environment:
+      GITEA_INSTANCE_URL: http://server:3000
+      GITEA_RUNNER_NAME: local-dotnet
+      GITEA_RUNNER_LABELS: local-dotnet:host
+      GITEA_RUNNER_REGISTRATION_TOKEN_FILE: /data/registration-token
+      GITEA_MAX_REG_ATTEMPTS: '3'
+      CONFIG_FILE: /etc/gitea-runner.yaml
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+    networks:
+      - gitea
+    volumes:
+      - runner-data:/data
+      - runner-docker:/var/lib/docker
+      - ../local/gitea-runner.yaml:/etc/gitea-runner.yaml:ro
+
+volumes:
+  gitea-data:
+  runner-data:
+  runner-docker:

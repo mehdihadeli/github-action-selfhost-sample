@@ -1,0 +1,47 @@
+name: Verify image supply chain
+description: Verify exact signer identity, signed GitHub claims, and CycloneDX attestation.
+inputs:
+  image:
+    description: Immutable image reference in the configured registry and image repository.
+    required: true
+  registry:
+    default: ghcr.io
+  image-name:
+    default: ${{ github.repository }}
+  source-revision:
+    description: Expected application commit.
+    required: true
+  source-ref:
+    description: Exact signed source ref; main or a stable/RC release tag.
+    default: refs/heads/main
+  signing-identity:
+    description: Exact Fulcio certificate identity of the reusable CI workflow.
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
+      with:
+        cosign-release: v3.0.5
+    - shell: bash
+      id: verify
+      env:
+        IMAGE: ${{ inputs.image }}
+        COMMIT: ${{ inputs.source-revision }}
+        SOURCE_REF: ${{ inputs.source-ref }}
+        REPOSITORY: ${{ github.repository }}
+        REGISTRY: ${{ inputs.registry }}
+        IMAGE_NAME: ${{ inputs.image-name }}
+        IDENTITY: ${{ inputs.signing-identity }}
+      run: bash "$GITHUB_ACTION_PATH/verify.sh"
+    - name: Record Image Verification Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 🔐 Image Supply-Chain Verification
+        tool: Cosign
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: verify
+        success-label: VERIFIED
+        job-status: ${{ job.status }}
+        details: 'Require exact signer identity, source revision/ref, image digest, and CycloneDX attestation.'

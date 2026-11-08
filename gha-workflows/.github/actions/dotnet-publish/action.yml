@@ -1,0 +1,24 @@
+name: Publish .NET scan surface
+description: Publish the restored application project for artifact SCA and SBOM generation.
+inputs:
+  project:
+    description: Application csproj path, not a solution.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      id: publish
+      env:
+        PROJECT: ${{ inputs.project }}
+      run: dotnet publish "$PROJECT" --configuration Release --no-restore --output artifacts/publish /p:UseAppHost=false
+    - name: Record Application Publish Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 📦 Application Publish
+        tool: .NET SDK
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: publish
+        job-status: ${{ job.status }}
+        details: 'Published application scan surface in artifacts/publish.'

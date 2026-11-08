@@ -1,0 +1,24 @@
+name: Dockerfile policy lint
+description: Block Hadolint warnings and errors; retain informational findings in logs.
+inputs:
+  dockerfile:
+    description: Dockerfile path.
+    default: Dockerfile
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      id: lint
+      env:
+        DOCKERFILE: ${{ inputs.dockerfile }}
+      run: docker run --rm -i hadolint/hadolint:v2.15.1 hadolint --failure-threshold warning - < "$DOCKERFILE"
+    - name: Record Dockerfile Audit Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 🐳 Dockerfile Audit
+        tool: Hadolint
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: lint
+        job-status: ${{ job.status }}
+        details: 'Enforce warning-level Dockerfile policies.'

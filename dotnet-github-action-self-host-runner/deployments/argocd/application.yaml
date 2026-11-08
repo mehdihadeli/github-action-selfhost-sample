@@ -1,0 +1,26 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: simple-api-local
+  namespace: argocd
+spec:
+  project: simple-api
+  source:
+    repoURL: http://gitea.gitops-system.svc.cluster.local:3000/admin/simple-api-gitops.git
+    targetRevision: main
+    path: environments/local
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: simple-api
+  syncPolicy:
+    automated:
+      enabled: true
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m

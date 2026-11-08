@@ -1,0 +1,123 @@
+name: Docker image push
+description: Publish metadata tags for the already scanned candidate without rebuilding and return its immutable registry digest.
+inputs:
+  tag:
+    description: Primary tag of the loaded, scanned candidate.
+    required: true
+  registry:
+    description: Registry hostname, optionally including a port; no URL scheme or path.
+    default: ghcr.io
+  image-name:
+    description: Registry-relative image name, including namespace and optional service name.
+    default: ${{ github.repository }}
+  registry-username:
+    default: ${{ github.actor }}
+  registry-token:
+    description: Credentials with push permission for the selected registry.
+    required: true
+  docker-tag:
+    description: Same calculated version supplied to docker-image-build.
+    default: ''
+  publish-latest:
+    description: Include latest only for production releases.
+    default: 'false'
+outputs:
+  image:
+    description: Immutable published image reference.
+    value: ${{ steps.publish.outputs.image }}
+  digest:
+    description: Registry manifest digest.
+    value: ${{ steps.publish.outputs.digest }}
+  repository:
+    description: Registry image repository without tag or digest.
+    value: ${{ steps.prepare.outputs.image }}
+  tags:
+    description: All published metadata tags.
+    value: ${{ steps.meta.outputs.tags }}
+runs:
+  using: composite
+  steps:
+    - name: Validate Docker push inputs
+      id: prepare
+      shell: bash
+      env:
+        REGISTRY: ${{ inputs.registry }}
+        IMAGE_NAME: ${{ inputs.image-name }}
+        VERSION_TAG: ${{ inputs.docker-tag }}
+        PUBLISH_LATEST: ${{ inputs.publish-latest }}
+        REGISTRY_TOKEN: ${{ inputs.registry-token }}
+      run: |
+        registry="${REGISTRY,,}"
+        image_name="${IMAGE_NAME,,}"
+        [[ "$registry" =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]+)?$ ]]
+        component='[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*'
+        [[ "$image_name" =~ ^$component(/$component)*$ ]]
+        [[ -z "$VERSION_TAG" || "$VERSION_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]
+        [[ "$PUBLISH_LATEST" == true || "$PUBLISH_LATEST" == false ]]
+        if [[ -z "$REGISTRY_TOKEN" ]]; then
+          echo '::error::A push token is required for the selected registry.' >&2
+          exit 1
+        fi
+        echo "image=$registry/$image_name" >> "$GITHUB_OUTPUT"
+    - name: Log in to container registry
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ inputs.registry-username }}
+        password: ${{ inputs.registry-token }}
+    - name: Docker metadata
+      id: meta
+      uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
+      with:
+        images: ${{ steps.prepare.outputs.image }}
+        flavor: latest=false
+        tags: |
+          type=raw,value=${{ inputs.docker-tag }},enable=${{ inputs.docker-tag != '' }},priority=1000
+          type=raw,value=latest,enable=${{ inputs.publish-latest == 'true' }},priority=900
+          type=ref,event=branch
+          type=sha,format=short
+    - name: Set up Docker Buildx for registry inspection
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+    - name: Push scanned image without rebuilding
+      id: publish
+      shell: bash
+      env:
+        TAG: ${{ inputs.tag }}
+        METADATA: ${{ steps.meta.outputs.json }}
+        IMAGE_REPOSITORY: ${{ steps.prepare.outputs.image }}
+      run: |
+        tags="$(jq -ce '.tags | select(type == "array" and length > 0)' <<< "$METADATA")"
+        jq -e --arg image "$IMAGE_REPOSITORY" 'all(.[]; type == "string" and startswith($image + ":"))' <<< "$tags" >/dev/null
+        [[ "$TAG" == "$(jq -er '.[0]' <<< "$tags")" ]]
+        image_id="$(docker inspect --format '{{.Id}}' "$TAG")"
+        [[ "$image_id" =~ ^sha256:[a-f0-9]{64}$ ]]
+        digest=''
+        while IFS= read -r target; do
+          if [[ "$target" != "$TAG" ]]; then
+            docker tag "$TAG" "$target"
+          fi
+          [[ "$(docker inspect --format '{{.Id}}' "$target")" == "$image_id" ]]
+          docker push "$target"
+          target_digest="$(docker buildx imagetools inspect "$target" --format '{{json .Manifest}}' | jq -er '.digest')"
+          [[ "$target_digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          if [[ -z "$digest" ]]; then
+            digest="$target_digest"
+            remote_id="$(docker buildx imagetools inspect "$IMAGE_REPOSITORY@$digest" --raw | jq -er '.config.digest')"
+            [[ "$remote_id" == "$image_id" ]]
+          else
+            [[ "$target_digest" == "$digest" ]]
+          fi
+        done < <(jq -r '.[]' <<< "$tags")
+        echo "image=$IMAGE_REPOSITORY@$digest" >> "$GITHUB_OUTPUT"
+        echo "digest=$digest" >> "$GITHUB_OUTPUT"
+    - name: Record Docker Image Push Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 📤 Docker Image Push
+        tool: Docker and metadata-action
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: prepare,meta,publish
+        success-label: PUBLISHED
+        job-status: ${{ job.status }}
+        details: 'Publish version, branch, SHA, and eligible latest tags for the same scanned image; preserve its existing OCI labels and resolve its digest.'

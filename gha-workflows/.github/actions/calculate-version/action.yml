@@ -1,0 +1,56 @@
+name: Calculate release version
+description: Validate root version.json and calculate NBGV release versions, Docker tags, and target environments.
+inputs:
+  dotnet-version:
+    description: SDK used to run the NBGV CLI.
+    default: '10.0.x'
+outputs:
+  version:
+    description: Calculated release version.
+    value: ${{ steps.version.outputs.version }}
+  assembly_version:
+    description: NBGV assembly version.
+    value: ${{ steps.version.outputs.assembly_version }}
+  informational_version:
+    description: Release version with source commit metadata.
+    value: ${{ steps.version.outputs.informational_version }}
+  environment:
+    description: dev, staging, production, or none.
+    value: ${{ steps.version.outputs.environment }}
+  docker_tag:
+    description: Docker-compatible release tag.
+    value: ${{ steps.version.outputs.docker_tag }}
+  commit:
+    description: Short source commit SHA.
+    value: ${{ steps.version.outputs.commit }}
+runs:
+  using: composite
+  steps:
+    - name: Require root version manifest
+      id: manifest
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/calculate-version.sh" --validate-manifest
+    - name: Set up .NET for NBGV
+      uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
+      with:
+        dotnet-version: ${{ inputs.dotnet-version }}
+    - name: Calculate release version
+      id: version
+      shell: bash
+      run: |
+        set -euo pipefail
+        tool_directory="$(mktemp -d "$RUNNER_TEMP/nbgv.XXXXXX")"
+        trap 'rm -rf -- "$tool_directory"' EXIT
+        dotnet tool install nbgv --tool-path "$tool_directory"
+        NBGV="$tool_directory/nbgv" bash "$GITHUB_ACTION_PATH/calculate-version.sh"
+    - name: Record Version Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 🏷️ Release Version
+        tool: Nerdbank.GitVersioning
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: manifest,version
+        success-label: CALCULATED
+        job-status: ${{ job.status }}
+        details: 'Root version.json, full Git history, validated release ref, and Docker-compatible release version.'

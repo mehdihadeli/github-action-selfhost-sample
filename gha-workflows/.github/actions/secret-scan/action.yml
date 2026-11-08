@@ -1,0 +1,119 @@
+name: Secret Detection (Gitleaks)
+description: Detect secrets with Gitleaks Action v2, full Git history validation, and CLI compatibility modes with redacted SARIF evidence.
+inputs:
+  config-path:
+    description: Optional repository-relative Gitleaks configuration; empty uses normal discovery and built-in defaults.
+    default: ''
+  fail-on-leak:
+    description: Fail on findings; false is explicit report-only mode. Scanner errors still fail.
+    default: 'true'
+  scan-mode:
+    description: git for checked-out history, or dir for current working files.
+    default: git
+  gitleaks-license:
+    description: Marketplace action license required for organization-owned repositories; pass as a secret.
+    required: false
+  upload-sarif:
+    default: 'true'
+runs:
+  using: composite
+  steps:
+    - name: Validate secret scan policy
+      id: prepare
+      shell: bash
+      env:
+        CONFIG_PATH: ${{ inputs.config-path }}
+        FAIL_ON_LEAK: ${{ inputs.fail-on-leak }}
+        SCAN_MODE: ${{ inputs.scan-mode }}
+      run: |
+        [[ "$FAIL_ON_LEAK" == true || "$FAIL_ON_LEAK" == false ]]
+        [[ "$SCAN_MODE" == git || "$SCAN_MODE" == dir ]]
+        if [[ -n "$CONFIG_PATH" ]]; then
+          [[ -f "$CONFIG_PATH" ]]
+        fi
+        mkdir -p artifacts/security
+        rm -f artifacts/security/gitleaks.sarif
+        engine=cli
+        if [[ "$SCAN_MODE" == git && "$FAIL_ON_LEAK" == true ]]; then
+          engine=action
+        fi
+        echo "engine=$engine" >> "$GITHUB_OUTPUT"
+    - name: Run Gitleaks Action
+      id: scan
+      if: steps.prepare.outputs.engine == 'action'
+      uses: gitleaks/gitleaks-action@v2
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        GITLEAKS_LICENSE: ${{ inputs.gitleaks-license }}
+        GITLEAKS_CONFIG: ${{ inputs.config-path }}
+        GITLEAKS_VERSION: 8.30.1
+        GITLEAKS_ENABLE_COMMENTS: 'false'
+        GITLEAKS_ENABLE_UPLOAD_ARTIFACT: 'false'
+        GITLEAKS_ENABLE_SUMMARY: 'false'
+    - name: Validate full Git history and retain redacted report
+      id: history
+      if: always() && steps.prepare.outcome == 'success' && steps.prepare.outputs.engine == 'action' && (steps.scan.outcome == 'success' || steps.scan.outputs.exit-code != '')
+      shell: bash
+      env:
+        CONFIG_PATH: ${{ inputs.config-path }}
+      run: |
+        options=(--redact --report-format sarif --report-path artifacts/security/gitleaks.sarif --exit-code 1)
+        if [[ -n "$CONFIG_PATH" ]]; then
+          options+=(--config "$CONFIG_PATH")
+        fi
+        gitleaks git . "${options[@]}"
+    - name: Run directory or report-only Gitleaks scan
+      id: cli
+      if: steps.prepare.outputs.engine == 'cli'
+      shell: bash
+      env:
+        CONFIG_PATH: ${{ inputs.config-path }}
+        FAIL_ON_LEAK: ${{ inputs.fail-on-leak }}
+        SCAN_MODE: ${{ inputs.scan-mode }}
+      run: |
+        [[ "$FAIL_ON_LEAK" == true || "$FAIL_ON_LEAK" == false ]]
+        [[ "$SCAN_MODE" == git || "$SCAN_MODE" == dir ]]
+        mkdir -p artifacts/security
+        options=(--redact --report-format sarif --report-path artifacts/security/gitleaks.sarif)
+        if [[ -n "$CONFIG_PATH" ]]; then
+          [[ -f "$CONFIG_PATH" ]]
+          options+=(--config "$CONFIG_PATH")
+        fi
+        if [[ "$FAIL_ON_LEAK" == false ]]; then
+          echo '::notice::Secret findings are report-only; this is not an enforced secret gate.'
+          options+=(--exit-code 0)
+        else
+          options+=(--exit-code 1)
+        fi
+        docker run --rm -v "$GITHUB_WORKSPACE:/src" -w /src \
+          ghcr.io/gitleaks/gitleaks:v8.30.1 "$SCAN_MODE" . "${options[@]}"
+    - name: Retain secret evidence
+      if: always() && steps.prepare.outcome == 'success'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: secret-scan
+        path: artifacts/security/gitleaks.sarif
+        if-no-files-found: error
+        retention-days: 30
+    - name: Upload secrets SARIF
+      if: always() && steps.prepare.outcome == 'success' && inputs.upload-sarif == 'true' && hashFiles('artifacts/security/gitleaks.sarif') != ''
+      uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066
+      with:
+        sarif_file: artifacts/security/gitleaks.sarif
+        category: gitleaks
+    - name: Record Secret Scan Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 🔑 Secret Scanning
+        tool: Gitleaks v8.30.1
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: history,cli
+        completion-mode: any
+        success-label: PASS
+        job-status: ${{ job.status }}
+        report-only: ${{ inputs.fail-on-leak == 'false' }}
+        details: |
+          - **Policy:** Zero unencrypted credentials when enforcement is enabled
+          - **Scan Mode:** ${{ inputs.scan-mode }}
+          - **Report:** Redacted SARIF retained for 30 days; Security upload when enabled

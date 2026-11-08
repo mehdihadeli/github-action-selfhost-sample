@@ -1,0 +1,170 @@
+name: Infrastructure as Code Security (Checkov)
+description: Use the Checkov GitHub action to scan rendered Kubernetes or generic IaC with configurable policy and retained SARIF evidence.
+inputs:
+  directory:
+    description: Application Kustomize overlay or generic IaC directory.
+    default: deployments/gitops/environments/local
+  mode:
+    description: kustomize renders the workload and scans Dockerfile/workflows; directory scans the requested frameworks.
+    default: kustomize
+  frameworks:
+    description: Comma-separated Checkov frameworks for directory mode.
+    default: terraform,dockerfile,kubernetes
+  config-file:
+    description: Optional repository-relative Checkov configuration.
+    default: ''
+  soft-fail:
+    description: Explicit report-only findings mode; disabled in reusable CI.
+    default: 'false'
+  enable-snyk:
+    description: Optional independent HIGH+ Snyk IaC gate on directory; unaffected by soft-fail.
+    default: 'false'
+  snyk-token:
+    required: false
+  upload-sarif:
+    default: 'true'
+  dockerfile:
+    description: Application Dockerfile in kustomize mode.
+    default: Dockerfile
+  require-docker-healthcheck:
+    description: Disable only for shell-less images with enforced Kubernetes startup/readiness/liveness probes.
+    default: 'true'
+runs:
+  using: composite
+  steps:
+    - if: inputs.mode == 'kustomize'
+      uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede
+      with:
+        version: v1.35.5
+    - name: Prepare Checkov IaC scans
+      id: prepare
+      shell: bash
+      env:
+        DIRECTORY: ${{ inputs.directory }}
+        MODE: ${{ inputs.mode }}
+        FRAMEWORKS: ${{ inputs.frameworks }}
+        CONFIG_FILE: ${{ inputs.config-file }}
+        SOFT_FAIL: ${{ inputs.soft-fail }}
+        DOCKERFILE: ${{ inputs.dockerfile }}
+        REQUIRE_DOCKER_HEALTHCHECK: ${{ inputs.require-docker-healthcheck }}
+      run: |
+        set -euo pipefail
+        [[ "$MODE" == kustomize || "$MODE" == directory ]]
+        [[ "$SOFT_FAIL" == true || "$SOFT_FAIL" == false ]]
+        [[ "$REQUIRE_DOCKER_HEALTHCHECK" == true || "$REQUIRE_DOCKER_HEALTHCHECK" == false ]]
+        [[ -d "$DIRECTORY" ]]
+        mkdir -p artifacts/security
+        if [[ -n "$CONFIG_FILE" ]]; then
+          [[ -f "$CONFIG_FILE" ]]
+        fi
+        if [[ "$SOFT_FAIL" == true ]]; then
+          echo '::notice::IaC findings are report-only; this is not an enforced IaC gate.'
+        fi
+        if [[ "$MODE" == directory ]]; then
+          IFS=, read -r -a frameworks <<< "$FRAMEWORKS"
+          [[ ${#frameworks[@]} -gt 0 ]]
+        else
+          [[ -f "$DOCKERFILE" ]]
+          [[ -d .github/workflows ]]
+          kubectl kustomize "$DIRECTORY" > artifacts/security/workload.yaml
+          if [[ "$REQUIRE_DOCKER_HEALTHCHECK" == false ]]; then
+            echo '::notice::CKV_DOCKER_2 excepted for shell-less runtime; Kubernetes probe policies remain enforced.'
+          fi
+        fi
+    - name: Run Checkov IaC directory scanner
+      id: scan
+      if: ${{ !cancelled() && steps.prepare.outcome == 'success' && inputs.mode == 'directory' }}
+      uses: bridgecrewio/checkov-action@45edc9d8856b664db2ec251f5f8632361f0a67aa
+      with:
+        directory: ${{ inputs.directory }}
+        framework: ${{ inputs.frameworks }}
+        quiet: 'true'
+        soft_fail: ${{ inputs.soft-fail }}
+        hard_fail_on: ${{ inputs.soft-fail == 'false' && 'CKV_*,BC_*' || '' }}
+        config_file: ${{ inputs.config-file }}
+        output_format: cli,sarif
+        output_file_path: console,artifacts/security/checkov-directory.sarif
+    - name: Run Checkov rendered Kubernetes scanner
+      id: kubernetes
+      if: ${{ !cancelled() && steps.prepare.outcome == 'success' && inputs.mode == 'kustomize' }}
+      uses: bridgecrewio/checkov-action@45edc9d8856b664db2ec251f5f8632361f0a67aa
+      with:
+        file: artifacts/security/workload.yaml
+        framework: kubernetes
+        quiet: 'true'
+        soft_fail: ${{ inputs.soft-fail }}
+        hard_fail_on: ${{ inputs.soft-fail == 'false' && 'CKV_*,BC_*' || '' }}
+        config_file: ${{ inputs.config-file }}
+        output_format: cli,sarif
+        output_file_path: console,artifacts/security/checkov-kubernetes.sarif
+    - name: Run Checkov Dockerfile scanner
+      id: dockerfile
+      if: ${{ !cancelled() && steps.prepare.outcome == 'success' && inputs.mode == 'kustomize' }}
+      uses: bridgecrewio/checkov-action@45edc9d8856b664db2ec251f5f8632361f0a67aa
+      with:
+        file: ${{ inputs.dockerfile }}
+        framework: dockerfile
+        skip_check: ${{ inputs.require-docker-healthcheck == 'false' && 'CKV_DOCKER_2' || '' }}
+        quiet: 'true'
+        soft_fail: ${{ inputs.soft-fail }}
+        hard_fail_on: ${{ inputs.soft-fail == 'false' && 'CKV_*,BC_*' || '' }}
+        config_file: ${{ inputs.config-file }}
+        output_format: cli,sarif
+        output_file_path: console,artifacts/security/checkov-dockerfile.sarif
+    - name: Run Checkov GitHub workflow scanner
+      id: workflows
+      if: ${{ !cancelled() && steps.prepare.outcome == 'success' && inputs.mode == 'kustomize' }}
+      uses: bridgecrewio/checkov-action@45edc9d8856b664db2ec251f5f8632361f0a67aa
+      with:
+        directory: .github/workflows
+        framework: github_actions
+        quiet: 'true'
+        soft_fail: ${{ inputs.soft-fail }}
+        hard_fail_on: ${{ inputs.soft-fail == 'false' && 'CKV_*,BC_*' || '' }}
+        config_file: ${{ inputs.config-file }}
+        output_format: cli,sarif
+        output_file_path: console,artifacts/security/checkov-workflows.sarif
+    - name: Retain IaC evidence
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: iac-scan
+        path: |
+          artifacts/security/checkov-*.sarif
+          artifacts/security/workload.yaml
+        if-no-files-found: error
+        retention-days: 30
+    - name: Upload IaC SARIF
+      if: always() && inputs.upload-sarif == 'true' && hashFiles('artifacts/security/checkov-*.sarif') != ''
+      uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066
+      with:
+        sarif_file: artifacts/security
+        category: checkov-iac
+    - name: Run optional shared Snyk IaC gate
+      id: snyk
+      if: always() && inputs.enable-snyk == 'true'
+      uses: ./.catalog/.github/actions/security-scan
+      with:
+        type: iac
+        target: ${{ inputs.directory }}
+        scope: iac
+        enable-trivy: 'false'
+        enable-grype: 'false'
+        enable-snyk: ${{ inputs.enable-snyk }}
+        snyk-token: ${{ inputs.snyk-token }}
+        upload-sarif: ${{ inputs.upload-sarif }}
+    - name: Record IaC Scan Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 🏗️ IaC Security Scan
+        tool: Checkov GitHub action, optional Snyk IaC
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: ${{ inputs.mode == 'directory' && 'scan' || 'kubernetes,dockerfile,workflows' }}
+        job-status: ${{ job.status }}
+        report-only: ${{ inputs.soft-fail == 'true' }}
+        details: |
+          - **Target:** ${{ inputs.directory }}
+          - **Mode:** ${{ inputs.mode }}
+          - **Frameworks:** ${{ inputs.frameworks }} in directory mode; rendered workload, Dockerfile, and workflows in kustomize mode
+          - **Snyk Enabled:** ${{ inputs.enable-snyk }}; independently enforces HIGH+

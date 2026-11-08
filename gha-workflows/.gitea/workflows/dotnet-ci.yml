@@ -1,0 +1,63 @@
+name: Reusable Local .NET CI
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        required: true
+        type: string
+      test-project:
+        required: true
+        type: string
+      runner:
+        default: local-dotnet
+        type: string
+      server-url:
+        description: Gitea URL reachable from the local runner.
+        default: http://server:3000
+        type: string
+
+jobs:
+  build-test:
+    name: Build and Test
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out local application
+        shell: bash
+        env:
+          SERVER: ${{ inputs.server-url }}
+          REPOSITORY: ${{ github.repository }}
+          REVISION: ${{ github.sha }}
+        run: |
+          git init .
+          git remote add origin "$SERVER/$REPOSITORY.git"
+          git fetch --no-tags origin "$REVISION"
+          git checkout --detach FETCH_HEAD
+      - name: Check out local workflow catalog
+        shell: bash
+        env:
+          SERVER: ${{ inputs.server-url }}
+        run: git clone --single-branch --branch main "$SERVER/admin/gha-workflows.git" .catalog
+      - name: Locked restore
+        shell: bash
+        env:
+          PROJECT: ${{ inputs.project }}
+        run: dotnet restore "$PROJECT" --locked-mode
+      - uses: ./.catalog/.github/actions/dotnet-build
+        with:
+          project: ${{ inputs.project }}
+      - uses: ./.catalog/.github/actions/dotnet-test
+        with:
+          project: ${{ inputs.test-project }}
+          platform: vstest
+      - name: Record local execution policy
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Local Gitea CI'
+            echo 'Build and test run locally from the local reusable workflow catalog.'
+            echo 'CD, image publication, GitHub CodeQL and GitHub OIDC signing are disabled.'
+            echo 'This build/test profile is not the full security-gated release pipeline.'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,128 @@
+name: Docker image build
+description: Build a metadata-tagged image without pushing and retain the scanned-candidate archive contract.
+inputs:
+  context:
+    description: Docker build context.
+    default: '.'
+  dockerfile:
+    description: Dockerfile path.
+    default: Dockerfile
+  registry:
+    description: Registry hostname, optionally including a port; no URL scheme or path.
+    default: ghcr.io
+  image-name:
+    description: Registry-relative image name, including namespace and optional service name.
+    default: ${{ github.repository }}
+  registry-username:
+    default: ${{ github.actor }}
+  registry-token:
+    description: Optional credentials for private build dependencies.
+    default: ''
+  docker-tag:
+    description: Calculated release tag; empty generates branch/SHA metadata tags.
+    default: ''
+  publish-latest:
+    description: Include a local latest tag only for a production release; build never pushes.
+    default: 'false'
+  platforms:
+    description: Single platform for the archive-and-scan pipeline.
+    default: linux/amd64
+outputs:
+  tag:
+    description: Primary candidate tag; calculated version has highest priority.
+    value: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+  tags:
+    description: All generated image tags.
+    value: ${{ steps.meta.outputs.tags }}
+  labels:
+    description: OCI labels applied to the built image.
+    value: ${{ steps.meta.outputs.labels }}
+  image-id:
+    description: Docker config digest of the built candidate.
+    value: ${{ steps.archive.outputs.image-id }}
+  archive-sha256:
+    description: SHA256 checksum of the retained archive.
+    value: ${{ steps.archive.outputs.archive-sha256 }}
+runs:
+  using: composite
+  steps:
+    - name: Validate Docker build inputs
+      id: prepare
+      shell: bash
+      env:
+        REGISTRY: ${{ inputs.registry }}
+        IMAGE_NAME: ${{ inputs.image-name }}
+        VERSION_TAG: ${{ inputs.docker-tag }}
+        PUBLISH_LATEST: ${{ inputs.publish-latest }}
+        PLATFORMS: ${{ inputs.platforms }}
+      run: |
+        registry="${REGISTRY,,}"
+        image_name="${IMAGE_NAME,,}"
+        [[ "$registry" =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]+)?$ ]]
+        component='[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*'
+        [[ "$image_name" =~ ^$component(/$component)*$ ]]
+        [[ -z "$VERSION_TAG" || "$VERSION_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]
+        [[ "$PUBLISH_LATEST" == true || "$PUBLISH_LATEST" == false ]]
+        if [[ ! "$PLATFORMS" =~ ^[a-z0-9]+/[a-z0-9]+(/[a-z0-9]+)?$ ]]; then
+          echo '::error::Use one platform per scanned candidate. Multi-platform indexes require separate platform builds and scans.' >&2
+          exit 1
+        fi
+        echo "image=$registry/$image_name" >> "$GITHUB_OUTPUT"
+    - name: Log in to container registry
+      if: inputs.registry-token != ''
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ inputs.registry-username }}
+        password: ${{ inputs.registry-token }}
+    - name: Docker metadata
+      id: meta
+      uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
+      with:
+        images: ${{ steps.prepare.outputs.image }}
+        flavor: latest=false
+        tags: |
+          type=raw,value=${{ inputs.docker-tag }},enable=${{ inputs.docker-tag != '' }},priority=1000
+          type=raw,value=latest,enable=${{ inputs.publish-latest == 'true' }},priority=900
+          type=ref,event=branch
+          type=sha,format=short
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+    - name: Build candidate without pushing
+      id: build
+      uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.dockerfile }}
+        platforms: ${{ inputs.platforms }}
+        load: true
+        push: false
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        provenance: false
+    - name: Retain immutable candidate archive
+      id: archive
+      shell: bash
+      env:
+        TAG: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+      run: |
+        mkdir -p artifacts/image
+        docker save "$TAG" | gzip -n > artifacts/image/candidate.tar.gz
+        echo "image-id=$(docker inspect --format '{{.Id}}' "$TAG")" >> "$GITHUB_OUTPUT"
+        echo "archive-sha256=$(sha256sum artifacts/image/candidate.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: container-candidate
+        path: artifacts/image/candidate.tar.gz
+        if-no-files-found: error
+        retention-days: 7
+    - name: Record Docker Image Build Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 🐳 Docker Image Build
+        tool: Docker Buildx and metadata-action
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: prepare,meta,build,archive
+        job-status: ${{ job.status }}
+        details: 'Apply version/branch/SHA metadata and OCI labels, build without pushing, and retain the exact candidate archive for 7 days.'

@@ -1,0 +1,122 @@
+name: GitOps manifest promotion and rollback
+description: Verify image signatures and SBOMs, then promote or restore a Kustomize image digest without cluster credentials.
+inputs:
+  operation:
+    description: promote a verified image or rollback one failed promotion.
+    default: promote
+  promotion-revision:
+    description: Exact failed GitOps commit; required for rollback.
+    default: ''
+  image:
+    description: Configured registry image with immutable digest.
+    required: true
+  registry:
+    default: ghcr.io
+  image-name:
+    default: ${{ github.repository }}
+  registry-username:
+    default: ${{ github.actor }}
+  registry-token:
+    description: Registry pull credentials; GHCR defaults to github.token.
+    default: ''
+  source-revision:
+    description: Application commit that produced the image.
+    required: true
+  source-ref:
+    description: Exact signed source ref; main or a stable/RC release tag.
+    default: refs/heads/main
+  signing-identity:
+    description: Exact reusable CI workflow certificate identity, including its Git ref.
+    required: true
+  repo-url:
+    description: HTTP(S) GitOps repository clone URL reachable from the runner.
+    required: true
+  branch:
+    description: GitOps branch tracked by Argo CD.
+    default: main
+  manifest-path:
+    description: Repository-relative Kustomization file to update.
+    default: environments/local/kustomization.yaml
+  image-key:
+    description: Existing Kustomize images entry name.
+    default: simple-api
+  username:
+    description: GitOps bot username.
+    required: true
+  token:
+    description: GitOps bot token with write access only to the deployment repository.
+    required: true
+outputs:
+  revision:
+    description: Exact GitOps commit to wait for, including an existing no-op commit.
+    value: ${{ steps.update.outputs.revision }}
+  status:
+    description: promoted, unchanged, stale, reverted, or superseded.
+    value: ${{ steps.update.outputs.status }}
+  image:
+    description: Previous verified image restored by rollback.
+    value: ${{ steps.update.outputs.image }}
+runs:
+  using: composite
+  steps:
+    - name: Validate GitOps operation
+      shell: bash
+      env:
+        OPERATION: ${{ inputs.operation }}
+      run: '[[ "$OPERATION" == promote || "$OPERATION" == rollback ]]'
+    - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
+      with:
+        cosign-release: v3.0.5
+    - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ inputs.registry-username }}
+        password: ${{ inputs.registry-token || (inputs.registry == 'ghcr.io' && github.token) || '' }}
+    - name: Verify image signature and SBOM attestation
+      if: inputs.operation == 'promote'
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        COMMIT: ${{ inputs.source-revision }}
+        SOURCE_REF: ${{ inputs.source-ref }}
+        REPOSITORY: ${{ github.repository }}
+        REGISTRY: ${{ inputs.registry }}
+        IMAGE_NAME: ${{ inputs.image-name }}
+        IDENTITY: ${{ inputs.signing-identity }}
+      run: bash "$GITHUB_ACTION_PATH/../verify-image/verify.sh"
+    - name: Update desired state in Git
+      id: update
+      shell: bash
+      env:
+        OPERATION: ${{ inputs.operation }}
+        PROMOTION_REVISION: ${{ inputs.promotion-revision }}
+        IMAGE: ${{ inputs.image }}
+        COMMIT: ${{ inputs.source-revision }}
+        SOURCE_REF: ${{ inputs.source-ref }}
+        REPO_URL: ${{ inputs.repo-url }}
+        BRANCH: ${{ inputs.branch }}
+        MANIFEST_PATH: ${{ inputs.manifest-path }}
+        IMAGE_KEY: ${{ inputs.image-key }}
+        GITOPS_USERNAME: ${{ inputs.username }}
+        GITOPS_TOKEN: ${{ inputs.token }}
+        GH_TOKEN: ${{ github.token }}
+        REPOSITORY: ${{ github.repository }}
+        REGISTRY: ${{ inputs.registry }}
+        IMAGE_NAME: ${{ inputs.image-name }}
+        IDENTITY: ${{ inputs.signing-identity }}
+      run: |
+        if [[ "$OPERATION" == rollback ]]; then
+          bash "$GITHUB_ACTION_PATH/rollback.sh"
+        else
+          bash "$GITHUB_ACTION_PATH/promote.sh"
+        fi
+    - name: Record GitOps Promotion Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 🔀 GitOps Promotion
+        tool: Git and Cosign
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: update
+        job-status: ${{ job.status }}
+        details: 'Operation: ${{ inputs.operation }}. Verify image provenance and update Git desired state; this is not deployment success.'

@@ -1,0 +1,18 @@
+name: ARC runner smoke
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  runner:
+    runs-on: arc-devsecops
+    timeout-minutes: 5
+    steps:
+      - name: Verify runner tools and Docker sidecar
+        shell: bash
+        run: |
+          git --version
+          curl --version
+          jq --version
+          python3 --version
+          docker version
+          docker run --rm alpine:3.22 echo 'ARC DinD is ready'

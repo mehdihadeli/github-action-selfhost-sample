@@ -1,0 +1,134 @@
+name: Container Image Signing (Sigstore Cosign)
+description: Sign an immutable registry image, optionally attest its SBOM, and verify exact GitHub identity and source claims.
+inputs:
+  image-ref:
+    description: Immutable reference in the configured registry and image repository.
+    required: true
+  registry:
+    default: ghcr.io
+  image-name:
+    default: ${{ github.repository }}
+  signing-identity:
+    description: Exact Fulcio identity of the signing workflow, not a wildcard pattern.
+    required: true
+  source-revision:
+    default: ${{ github.sha }}
+  source-ref:
+    description: Exact caller ref; main or a stable/RC release tag.
+    default: refs/heads/main
+  enable-attestation:
+    default: 'true'
+  sbom-path:
+    description: Required when attestation is enabled.
+    default: ''
+  attestation-type:
+    description: cyclonedx or spdxjson; must match the supplied predicate.
+    default: cyclonedx
+runs:
+  using: composite
+  steps:
+    - name: Validate signing inputs
+      id: prepare
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image-ref }}
+        REPOSITORY: ${{ github.repository }}
+        REGISTRY: ${{ inputs.registry }}
+        IMAGE_NAME: ${{ inputs.image-name }}
+        COMMIT: ${{ inputs.source-revision }}
+        SOURCE_REF: ${{ inputs.source-ref }}
+        IDENTITY: ${{ inputs.signing-identity }}
+        ENABLE_ATTESTATION: ${{ inputs.enable-attestation }}
+        SBOM: ${{ inputs.sbom-path }}
+        ATTESTATION_TYPE: ${{ inputs.attestation-type }}
+      run: |
+        [[ "$COMMIT" =~ ^[a-f0-9]{40}$ ]]
+        release_number='(0|[1-9][0-9]*)'
+        tag_pattern="^refs/tags/v${release_number}\\.${release_number}\\.${release_number}(-rc\\.${release_number})?$"
+        [[ "$SOURCE_REF" == refs/heads/main || "$SOURCE_REF" =~ $tag_pattern ]]
+        registry="${REGISTRY,,}"
+        image_name="${IMAGE_NAME,,}"
+        [[ "$registry" =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]+)?$ ]]
+        component='[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*'
+        [[ "$image_name" =~ ^$component(/$component)*$ ]]
+        [[ "$IMAGE" == "$registry/$image_name@sha256:"* ]]
+        [[ "${IMAGE#*@sha256:}" =~ ^[a-f0-9]{64}$ ]]
+        [[ -n "$IDENTITY" ]]
+        [[ "$ENABLE_ATTESTATION" == true || "$ENABLE_ATTESTATION" == false ]]
+        [[ "$ATTESTATION_TYPE" == cyclonedx || "$ATTESTATION_TYPE" == spdxjson ]]
+        if [[ "$ENABLE_ATTESTATION" == true ]]; then
+          [[ -f "$SBOM" ]]
+          if [[ "$ATTESTATION_TYPE" == cyclonedx ]]; then
+            jq -e '.bomFormat == "CycloneDX"' "$SBOM" >/dev/null
+          else
+            jq -e '.spdxVersion | startswith("SPDX-")' "$SBOM" >/dev/null
+          fi
+        fi
+        mkdir -p artifacts/security
+    - name: Install Cosign
+      uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
+      with:
+        cosign-release: v3.0.5
+    - name: Sign container image with GitHub OIDC
+      id: sign
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image-ref }}
+      run: cosign sign --yes "$IMAGE"
+    - name: Attach SBOM attestation
+      id: attest
+      if: inputs.enable-attestation == 'true'
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image-ref }}
+        SBOM: ${{ inputs.sbom-path }}
+        ATTESTATION_TYPE: ${{ inputs.attestation-type }}
+      run: cosign attest --yes --type "$ATTESTATION_TYPE" --predicate "$SBOM" "$IMAGE"
+    - name: Verify signature and enabled attestation
+      id: verify
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image-ref }}
+        REPOSITORY: ${{ github.repository }}
+        COMMIT: ${{ inputs.source-revision }}
+        SOURCE_REF: ${{ inputs.source-ref }}
+        IDENTITY: ${{ inputs.signing-identity }}
+        ENABLE_ATTESTATION: ${{ inputs.enable-attestation }}
+        ATTESTATION_TYPE: ${{ inputs.attestation-type }}
+      run: |
+        claims=(--certificate-oidc-issuer https://token.actions.githubusercontent.com
+          --certificate-identity "$IDENTITY"
+          --certificate-github-workflow-repository "$REPOSITORY"
+          --certificate-github-workflow-sha "$COMMIT"
+          --certificate-github-workflow-ref "$SOURCE_REF"
+          --certificate-github-workflow-trigger push)
+        cosign verify "${claims[@]}" "$IMAGE" > artifacts/security/image-signature.json
+        if [[ "$ENABLE_ATTESTATION" == true ]]; then
+          cosign verify-attestation --type "$ATTESTATION_TYPE" "${claims[@]}" "$IMAGE" \
+            > artifacts/security/image-attestation.json
+        fi
+    - name: Retain signature verification evidence
+      if: always() && steps.prepare.outcome == 'success'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: image-signing-evidence
+        path: |
+          artifacts/security/image-signature.json
+          artifacts/security/image-attestation.json
+        if-no-files-found: error
+        retention-days: 30
+    - name: Record Image Signing Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 🔏 Image Signing
+        tool: Sigstore Cosign
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: sign,verify
+        success-label: VERIFIED
+        job-status: ${{ job.status }}
+        details: |
+          - **Image:** ${{ inputs.image-ref }}
+          - **Policy:** Exact GitHub OIDC identity and source revision verification
+          - **Attestation Enabled:** ${{ inputs.enable-attestation }}
+          - **Evidence:** Signature and enabled attestation verification, 30 days retention

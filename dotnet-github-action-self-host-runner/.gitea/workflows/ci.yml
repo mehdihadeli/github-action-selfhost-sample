@@ -1,0 +1,16 @@
+name: Local .NET CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  ci:
+    uses: self:admin/gha-workflows/.gitea/workflows/dotnet-ci.yml@main
+    with:
+      project: src/SimpleApi.csproj
+      test-project: tests/SimpleApi.Tests/SimpleApi.Tests.csproj
+      runner: local-dotnet

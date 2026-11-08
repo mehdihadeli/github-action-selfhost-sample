@@ -1,0 +1,118 @@
+name: .NET DevSecOps and GitOps
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: pipeline-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  ci:
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      security-events: write
+      packages: write
+      id-token: write
+      attestations: write
+    uses: mehdihadeli/gha-workflows/.github/workflows/dotnet-ci.yml@main
+    with:
+      project: src/SimpleApi.csproj
+      registry: ${{ vars.CONTAINER_REGISTRY || 'ghcr.io' }}
+      image-name: ${{ vars.CONTAINER_IMAGE || github.repository }}
+      registry-username: ${{ vars.REGISTRY_USERNAME || github.actor }}
+      publish-project: src/SimpleApi.csproj
+      test-project: tests/SimpleApi.Tests/SimpleApi.Tests.csproj
+      test-platform: vstest
+      require-tests: true
+      collect-coverage: false
+      iac-directory: deployments/gitops/environments/local
+      require-docker-healthcheck: false
+      dotnet-version: '10.0.x'
+      runner: arc-devsecops
+      catalog-ref: main
+      enable-snyk: ${{ vars.ENABLE_SNYK == 'true' }}
+      enable-sonar: ${{ vars.ENABLE_SONAR == 'true' }}
+      sonar-project-key: ${{ vars.SONAR_PROJECT_KEY }}
+      sonar-organization: ${{ vars.SONAR_ORGANIZATION }}
+      sonar-host-url: ${{ vars.SONAR_HOST_URL || 'https://sonarcloud.io' }}
+      enable-dependency-track: ${{ vars.ENABLE_DEPENDENCY_TRACK == 'true' }}
+      dependency-track-url: ${{ vars.DEPENDENCY_TRACK_URL }}
+    secrets:
+      registry-token: ${{ secrets.REGISTRY_TOKEN }}
+      gitleaks-license: ${{ secrets.GITLEAKS_LICENSE }}
+      snyk-token: ${{ secrets.SNYK_TOKEN }}
+      sonar-token: ${{ secrets.SONAR_TOKEN }}
+      dependency-track-api-key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}
+  promote:
+    name: Deploy to ${{ startsWith(github.ref, 'refs/tags/v') && 'Staging' || 'Development' }}
+    needs: ci
+    if: vars.ENABLE_CD == 'true' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && needs.ci.outputs.image != ''
+    permissions:
+      contents: read
+      packages: read
+    uses: mehdihadeli/gha-workflows/.github/workflows/dotnet-cd.yml@main
+    with:
+      version: ${{ needs.ci.outputs.version }}
+      image: ${{ needs.ci.outputs.image }}
+      registry: ${{ vars.CONTAINER_REGISTRY || 'ghcr.io' }}
+      image-name: ${{ vars.CONTAINER_IMAGE || github.repository }}
+      registry-username: ${{ vars.REGISTRY_USERNAME || github.actor }}
+      source-revision: ${{ github.sha }}
+      source-ref: ${{ github.ref }}
+      repo-url: ${{ vars.GITOPS_REPO_URL }}
+      username: ${{ vars.GITOPS_USERNAME }}
+      environment: ${{ startsWith(github.ref, 'refs/tags/v') && (vars.STAGING_ENVIRONMENT || 'local') || (vars.DEVELOPMENT_ENVIRONMENT || 'local') }}
+      manifest-path: ${{ vars.GITOPS_MANIFEST_PATH || format('environments/{0}/kustomization.yaml', startsWith(github.ref, 'refs/tags/v') && (vars.STAGING_ENVIRONMENT || 'local') || (vars.DEVELOPMENT_ENVIRONMENT || 'local')) }}
+      runner: arc-devsecops
+      catalog-ref: main
+      validate-deployment: ${{ vars.VALIDATE_DEPLOYMENT == 'true' }}
+      argocd-server: ${{ vars.ARGOCD_SERVER }}
+      argocd-application: ${{ vars.ARGOCD_APPLICATION || format('simple-api-{0}', startsWith(github.ref, 'refs/tags/v') && (vars.STAGING_ENVIRONMENT || 'local') || (vars.DEVELOPMENT_ENVIRONMENT || 'local')) }}
+      argocd-ca-file: ${{ vars.ARGOCD_CA_FILE }}
+      application-url: ${{ vars.APPLICATION_URL || 'http://traefik.kube-system.svc.cluster.local/' }}
+      enable-k6: ${{ vars.ENABLE_K6 == 'true' }}
+      enable-zap: ${{ vars.ENABLE_ZAP == 'true' }}
+      enable-rollback: ${{ vars.ENABLE_ROLLBACK == 'true' }}
+    secrets:
+      registry-token: ${{ secrets.REGISTRY_TOKEN }}
+      gitops-token: ${{ secrets.GITOPS_TOKEN }}
+      argocd-token: ${{ secrets.ARGOCD_TOKEN }}
+      slack-webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+  deploy-prod:
+    name: Deploy to Production (after staging validation)
+    needs: [ci, promote]
+    if: vars.ENABLE_CD == 'true' && vars.ENABLE_PRODUCTION == 'true' && needs.ci.outputs.environment == 'production' && needs.promote.outputs.validated == 'true' && needs.ci.outputs.image != ''
+    permissions:
+      contents: read
+      packages: read
+    uses: mehdihadeli/gha-workflows/.github/workflows/dotnet-cd.yml@main
+    with:
+      version: ${{ needs.ci.outputs.version }}
+      image: ${{ needs.ci.outputs.image }}
+      registry: ${{ vars.CONTAINER_REGISTRY || 'ghcr.io' }}
+      image-name: ${{ vars.CONTAINER_IMAGE || github.repository }}
+      registry-username: ${{ vars.REGISTRY_USERNAME || github.actor }}
+      source-revision: ${{ github.sha }}
+      source-ref: ${{ github.ref }}
+      repo-url: ${{ vars.PRODUCTION_GITOPS_REPO_URL }}
+      username: ${{ vars.PRODUCTION_GITOPS_USERNAME }}
+      environment: production
+      manifest-path: environments/production/kustomization.yaml
+      runner: arc-devsecops
+      catalog-ref: main
+      validate-deployment: true
+      enable-rollback: ${{ vars.ENABLE_PRODUCTION_ROLLBACK == 'true' }}
+      argocd-server: ${{ vars.PRODUCTION_ARGOCD_SERVER }}
+      argocd-application: ${{ vars.PRODUCTION_ARGOCD_APPLICATION }}
+      argocd-ca-file: ${{ vars.PRODUCTION_ARGOCD_CA_FILE }}
+      application-url: ${{ vars.PRODUCTION_APPLICATION_URL }}
+    secrets:
+      registry-token: ${{ secrets.REGISTRY_TOKEN }}
+      gitops-token: ${{ secrets.PRODUCTION_GITOPS_TOKEN }}
+      argocd-token: ${{ secrets.PRODUCTION_ARGOCD_TOKEN }}
+      slack-webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}

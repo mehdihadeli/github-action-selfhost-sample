@@ -1,0 +1,53 @@
+name: Wait for exact Argo CD revision
+description: Read-only API polling for the promoted commit, Synced state, Healthy state, and expected image.
+inputs:
+  server:
+    description: Argo CD HTTPS API base URL reachable from the runner.
+    required: true
+  application:
+    description: Single-source Argo CD Application name.
+    required: true
+  revision:
+    description: Exact GitOps commit returned by promotion.
+    required: true
+  image:
+    description: Expected verified digest in the Application image summary.
+    required: true
+  token:
+    description: Project-scoped applications,get token; no sync or cluster permission.
+    required: true
+  timeout-seconds:
+    default: '900'
+    description: Bounded wait, from 1 to 1800 seconds.
+  ca-file:
+    default: ''
+    description: Optional trusted CA PEM path for a private Argo CD certificate.
+  allow-http:
+    default: 'false'
+    description: Isolated local lab only; never use for production.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      id: wait
+      env:
+        ARGO_SERVER: ${{ inputs.server }}
+        ARGO_APP: ${{ inputs.application }}
+        ARGO_REVISION: ${{ inputs.revision }}
+        ARGO_IMAGE: ${{ inputs.image }}
+        ARGO_TOKEN: ${{ inputs.token }}
+        ARGO_TIMEOUT: ${{ inputs.timeout-seconds }}
+        ARGO_CA: ${{ inputs.ca-file }}
+        ARGO_ALLOW_HTTP: ${{ inputs.allow-http }}
+      run: python3 "$GITHUB_ACTION_PATH/wait.py"
+    - name: Record Reconciliation Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 🔄 Argo CD Reconciliation
+        tool: Argo CD API
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: wait
+        success-label: VERIFIED
+        job-status: ${{ job.status }}
+        details: 'Require exact GitOps revision, expected image, Synced, and Healthy.'

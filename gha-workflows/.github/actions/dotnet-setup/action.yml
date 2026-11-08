@@ -1,0 +1,30 @@
+name: .NET setup and locked restore
+description: Install the selected SDK and restore a project with committed dependency locks.
+inputs:
+  project:
+    description: Project or solution path.
+    required: true
+  dotnet-version:
+    description: SDK version.
+    default: '10.0.x'
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
+      with:
+        dotnet-version: ${{ inputs.dotnet-version }}
+    - shell: bash
+      env:
+        PROJECT: ${{ inputs.project }}
+      id: restore
+      run: dotnet restore "$PROJECT" --locked-mode
+    - name: Record Setup Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: ⚙️ .NET Setup
+        tool: .NET SDK
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: restore
+        job-status: ${{ job.status }}
+        details: 'Install configured SDK and restore locked dependencies.'

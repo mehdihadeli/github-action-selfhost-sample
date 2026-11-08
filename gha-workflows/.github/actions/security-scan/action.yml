@@ -1,0 +1,243 @@
+name: Shared security scan (Trivy, Grype, and Snyk)
+description: Shared inventory, configurable scanner gates for applications, images, and IaC, SARIF evidence, and outcome reporting.
+inputs:
+  type:
+    description: fs or repo for checked-out files, image for a loaded Docker image, or iac for Snyk-only infrastructure scanning.
+    default: fs
+  target:
+    description: Repository-relative directory or local Docker image reference.
+    default: .
+  scope:
+    description: source, app, image, or iac evidence prefix; Snyk supports app, image, and iac.
+    default: app
+  severity:
+    default: HIGH,CRITICAL
+  exit-code:
+    description: 1 enforces findings; 0 is explicit report-only mode. Scanner errors still fail.
+    default: '1'
+  scanners:
+    default: vuln,secret
+  skip-dirs:
+    default: .git,.catalog
+  trivyignores:
+    description: Optional comma-separated repository-relative Trivy ignore paths.
+    default: ''
+  enable-trivy:
+    description: Run Trivy inventory and scans; disable for Snyk-only scanning.
+    default: 'true'
+  enable-grype:
+    default: 'true'
+  enable-snyk:
+    description: Optional HIGH+ Snyk gate; enforced independently of exit-code and requires snyk-token.
+    default: 'false'
+  snyk-target:
+    description: Application csproj, IaC directory, or image reference; empty uses target.
+    default: ''
+  snyk-token:
+    description: Snyk token; enabled scans fail when missing.
+    required: false
+  dockerfile:
+    description: Dockerfile for Snyk image analysis.
+    default: Dockerfile
+  artifact-name:
+    description: Optional evidence artifact name; empty uses sca followed by scope.
+    default: ''
+  upload-sarif:
+    default: 'true'
+runs:
+  using: composite
+  steps:
+    - name: Validate security scan policy
+      id: prepare
+      shell: bash
+      env:
+        TYPE: ${{ inputs.type }}
+        TARGET: ${{ inputs.target }}
+        SCOPE: ${{ inputs.scope }}
+        SEVERITY: ${{ inputs.severity }}
+        EXIT_CODE: ${{ inputs.exit-code }}
+        ENABLE_TRIVY: ${{ inputs.enable-trivy }}
+        ENABLE_GRYPE: ${{ inputs.enable-grype }}
+        ENABLE_SNYK: ${{ inputs.enable-snyk }}
+      run: |
+        [[ "$TYPE" == fs || "$TYPE" == repo || "$TYPE" == image || "$TYPE" == iac ]]
+        [[ "$SCOPE" == source || "$SCOPE" == app || "$SCOPE" == image || "$SCOPE" == iac ]]
+        [[ "$EXIT_CODE" == 0 || "$EXIT_CODE" == 1 ]]
+        [[ "$ENABLE_TRIVY" == true || "$ENABLE_TRIVY" == false ]]
+        [[ "$ENABLE_GRYPE" == true || "$ENABLE_GRYPE" == false ]]
+        [[ "$ENABLE_SNYK" == true || "$ENABLE_SNYK" == false ]]
+        if [[ "$TYPE" == iac || "$SCOPE" == iac ]]; then
+          [[ "$TYPE" == iac && "$SCOPE" == iac && "$ENABLE_TRIVY" == false && "$ENABLE_GRYPE" == false ]]
+        fi
+        if [[ "$ENABLE_SNYK" == true ]]; then
+          [[ "$SCOPE" == app || "$SCOPE" == image || "$SCOPE" == iac ]]
+        fi
+        [[ -n "$TARGET" ]]
+        IFS=, read -r -a severities <<< "$SEVERITY"
+        [[ ${#severities[@]} -gt 0 ]]
+        minimum_rank=5
+        threshold=''
+        for severity in "${severities[@]}"; do
+          case "$severity" in
+            UNKNOWN) rank=0 ;;
+            LOW) rank=1 ;;
+            MEDIUM) rank=2 ;;
+            HIGH) rank=3 ;;
+            CRITICAL) rank=4 ;;
+            *) echo 'Invalid vulnerability severity.' >&2; exit 1 ;;
+          esac
+          if [[ "$rank" -lt "$minimum_rank" ]]; then
+            minimum_rank="$rank"
+            threshold="${severity,,}"
+          fi
+        done
+        echo "grype-threshold=$threshold" >> "$GITHUB_OUTPUT"
+        if [[ "$EXIT_CODE" == 0 && ( "$ENABLE_TRIVY" == true || "$ENABLE_GRYPE" == true ) ]]; then
+          echo '::notice::SCA findings are report-only; this is not an enforced vulnerability gate.'
+        fi
+        if [[ "$ENABLE_SNYK" == false ]]; then
+          echo '::notice::Snyk explicitly disabled. No Snyk result is claimed.'
+        fi
+        mkdir -p artifacts/security artifacts/trivy-cache
+    - name: Generate CycloneDX SBOM
+      id: inventory
+      if: inputs.enable-trivy == 'true'
+      uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+      with:
+        version: v0.76.2
+        scan-type: ${{ inputs.type }}
+        scan-ref: ${{ inputs.target }}
+        image-ref: ${{ inputs.type == 'image' && inputs.target || '' }}
+        skip-dirs: ${{ inputs.skip-dirs }}
+        format: cyclonedx
+        output: artifacts/security/${{ inputs.scope }}.cdx.json
+        cache-dir: artifacts/trivy-cache
+        timeout: 5m0s
+    - name: Run Trivy dependency scanner
+      id: trivy
+      if: always() && steps.prepare.outcome == 'success' && inputs.enable-trivy == 'true'
+      uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+      with:
+        version: v0.76.2
+        scan-type: ${{ inputs.type }}
+        scan-ref: ${{ inputs.target }}
+        image-ref: ${{ inputs.type == 'image' && inputs.target || '' }}
+        scanners: ${{ inputs.scanners }}
+        severity: ${{ inputs.severity }}
+        exit-code: ${{ inputs.exit-code }}
+        skip-dirs: ${{ inputs.skip-dirs }}
+        trivyignores: ${{ inputs.trivyignores }}
+        format: sarif
+        limit-severities-for-sarif: 'true'
+        output: artifacts/security/trivy-${{ inputs.scope }}.sarif
+        cache-dir: artifacts/trivy-cache
+        timeout: 5m0s
+    - name: Independent Grype vulnerability gate
+      id: grype
+      if: always() && steps.prepare.outcome == 'success' && inputs.enable-grype == 'true'
+      shell: bash
+      env:
+        TYPE: ${{ inputs.type }}
+        TARGET: ${{ inputs.target }}
+        SCOPE: ${{ inputs.scope }}
+        THRESHOLD: ${{ steps.prepare.outputs.grype-threshold }}
+        EXIT_CODE: ${{ inputs.exit-code }}
+      run: |
+        mkdir -p artifacts/security artifacts/grype-cache
+        options=(--rm -v "$GITHUB_WORKSPACE:/src" -w /src
+          -v "$GITHUB_WORKSPACE/artifacts/grype-cache:/cache"
+          -e GRYPE_DB_CACHE_DIR=/cache
+          -e GRYPE_DB_UPDATE_AVAILABLE_TIMEOUT=30s
+          -e GRYPE_DB_UPDATE_DOWNLOAD_TIMEOUT=3m)
+        source="dir:/src/$TARGET"
+        if [[ "$TYPE" == image ]]; then
+          options+=(-v /var/run/docker.sock:/var/run/docker.sock)
+          source="docker:$TARGET"
+        fi
+        policy=()
+        if [[ "$EXIT_CODE" == 1 ]]; then
+          policy+=(--fail-on "$THRESHOLD")
+        fi
+        docker run "${options[@]}" anchore/grype:v0.121.2 "$source" \
+          "${policy[@]}" --output sarif --file "artifacts/security/grype-$SCOPE.sarif"
+    - name: Set up optional Snyk scanner
+      id: snyk-setup
+      if: always() && steps.prepare.outcome == 'success' && inputs.enable-snyk == 'true'
+      uses: snyk/actions/setup@9adf32b1121593767fc3c057af55b55db032dc04
+      with:
+        snyk-version: v1.1308.4
+    - name: Run optional Snyk policy gate
+      id: snyk
+      if: always() && steps.prepare.outcome == 'success' && steps.snyk-setup.outcome == 'success' && inputs.enable-snyk == 'true'
+      shell: bash
+      env:
+        SNYK_TOKEN: ${{ inputs.snyk-token }}
+        KIND: ${{ inputs.scope }}
+        TARGET: ${{ inputs.snyk-target || inputs.target }}
+        DOCKERFILE: ${{ inputs.dockerfile }}
+      run: |
+        : "${SNYK_TOKEN:?Snyk enabled but token is missing.}"
+        mkdir -p artifacts/security
+        report="artifacts/security/snyk-$KIND.sarif"
+        case "$KIND" in
+          app)
+            assets="$(dirname "$TARGET")/obj/project.assets.json"
+            snyk test --file="$assets" --package-manager=nuget \
+              --severity-threshold=high --sarif-file-output="$report"
+            ;;
+          iac)
+            snyk iac test "$TARGET" --severity-threshold=high --sarif-file-output="$report"
+            ;;
+          image)
+            snyk container test "$TARGET" --file="$DOCKERFILE" \
+              --severity-threshold=high --sarif-file-output="$report"
+            ;;
+          *) echo "Unsupported Snyk scan: $KIND" >&2; exit 1 ;;
+        esac
+    - name: Retain security scan evidence
+      if: always() && steps.prepare.outcome == 'success' && (inputs.enable-trivy == 'true' || inputs.enable-grype == 'true' || inputs.enable-snyk == 'true')
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: ${{ inputs.artifact-name || format('sca-{0}', inputs.scope) }}
+        path: |
+          ${{ inputs.enable-trivy == 'true' && format('artifacts/security/{0}.cdx.json', inputs.scope) || '' }}
+          ${{ inputs.enable-trivy == 'true' && format('artifacts/security/trivy-{0}.sarif', inputs.scope) || '' }}
+          ${{ inputs.enable-grype == 'true' && format('artifacts/security/grype-{0}.sarif', inputs.scope) || '' }}
+          ${{ inputs.enable-snyk == 'true' && format('artifacts/security/snyk-{0}.sarif', inputs.scope) || '' }}
+        if-no-files-found: error
+        retention-days: 30
+    - name: Upload Trivy SCA SARIF
+      if: always() && steps.prepare.outcome == 'success' && inputs.enable-trivy == 'true' && inputs.upload-sarif == 'true' && hashFiles(format('artifacts/security/trivy-{0}.sarif', inputs.scope)) != ''
+      uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066
+      with:
+        sarif_file: artifacts/security/trivy-${{ inputs.scope }}.sarif
+        category: trivy-${{ inputs.scope }}
+    - name: Upload Grype SCA SARIF
+      if: always() && steps.prepare.outcome == 'success' && inputs.enable-grype == 'true' && inputs.upload-sarif == 'true' && hashFiles(format('artifacts/security/grype-{0}.sarif', inputs.scope)) != ''
+      uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066
+      with:
+        sarif_file: artifacts/security/grype-${{ inputs.scope }}.sarif
+        category: grype-${{ inputs.scope }}
+    - name: Upload Snyk SARIF
+      if: always() && steps.prepare.outcome == 'success' && inputs.enable-snyk == 'true' && inputs.upload-sarif == 'true' && hashFiles(format('artifacts/security/snyk-{0}.sarif', inputs.scope)) != ''
+      uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066
+      with:
+        sarif_file: artifacts/security/snyk-${{ inputs.scope }}.sarif
+        category: snyk-${{ inputs.scope }}
+    - name: Record Security Scan Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 🛡️ Shared Security Scan
+        tool: Trivy, Grype, optional Snyk
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: trivy,grype,snyk
+        completion-mode: any
+        job-status: ${{ job.status }}
+        report-only: ${{ inputs.exit-code == '0' && (inputs.enable-trivy == 'true' || inputs.enable-grype == 'true') }}
+        details: |
+          - **Target:** ${{ inputs.target }}
+          - **Severities Monitored:** ${{ inputs.severity }}
+          - **Trivy Enabled:** ${{ inputs.enable-trivy }}
+          - **Grype Enabled:** ${{ inputs.enable-grype }}
+          - **Snyk Enabled:** ${{ inputs.enable-snyk }}; independently enforces HIGH+

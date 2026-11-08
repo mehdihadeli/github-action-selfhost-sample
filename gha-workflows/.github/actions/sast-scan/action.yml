@@ -1,0 +1,56 @@
+name: Static Application Security Testing (Semgrep)
+description: Scan source with configurable security rules and retain SARIF without hiding scanner failures.
+inputs:
+  rules:
+    description: Whitespace-separated Semgrep rulesets or repository-relative rule files.
+    default: auto p/security-audit p/ci p/owasp-top-ten
+  upload-sarif:
+    description: Publish findings to GitHub code scanning; disable for fork pull requests.
+    default: 'true'
+runs:
+  using: composite
+  steps:
+    - name: Run Semgrep SAST
+      id: scan
+      shell: bash
+      env:
+        RULES: ${{ inputs.rules }}
+      run: |
+        mkdir -p artifacts/security
+        read -r -a rulesets <<< "${RULES//$'\n'/ }"
+        [[ ${#rulesets[@]} -gt 0 ]]
+        options=()
+        for ruleset in "${rulesets[@]}"; do
+          options+=(--config "$ruleset")
+        done
+        docker run --rm -v "$GITHUB_WORKSPACE:/src" -w /src \
+          semgrep/semgrep:1.184.0 semgrep scan "${options[@]}" \
+          --error --metrics=off --exclude .git --exclude .catalog --exclude artifacts \
+          --sarif --output artifacts/security/semgrep.sarif .
+    - name: Retain SAST evidence
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: sast-scan
+        path: artifacts/security/semgrep.sarif
+        if-no-files-found: error
+        retention-days: 30
+    - name: Upload SAST SARIF
+      if: always() && inputs.upload-sarif == 'true' && hashFiles('artifacts/security/semgrep.sarif') != ''
+      uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066
+      with:
+        sarif_file: artifacts/security/semgrep.sarif
+        category: semgrep
+    - name: Record SAST Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 🛡️ SAST Analysis
+        tool: Semgrep OSS
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: scan
+        job-status: ${{ job.status }}
+        details: |
+          - **Rulesets:** ${{ inputs.rules }}
+          - **Policy:** Findings in configured rules fail the scan
+          - **Report:** SARIF retained for 30 days; Security upload when enabled

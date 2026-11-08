@@ -1,0 +1,41 @@
+name: Load exact image candidate
+description: Validate the archive checksum and loaded image ID before scanning or publishing.
+inputs:
+  tag:
+    description: Expected candidate tag.
+    required: true
+  image-id:
+    description: Expected local Docker image ID.
+    required: true
+  archive-sha256:
+    description: Expected retained archive checksum.
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        name: container-candidate
+        path: artifacts/image
+    - shell: bash
+      id: load
+      env:
+        TAG: ${{ inputs.tag }}
+        IMAGE_ID: ${{ inputs.image-id }}
+        CHECKSUM: ${{ inputs.archive-sha256 }}
+      run: |
+        [[ "$CHECKSUM" =~ ^[a-f0-9]{64}$ ]]
+        printf '%s  artifacts/image/candidate.tar.gz\n' "$CHECKSUM" | sha256sum --check
+        gzip --decompress --stdout artifacts/image/candidate.tar.gz | docker load
+        test "$(docker inspect --format '{{.Id}}' "$TAG")" = "$IMAGE_ID"
+    - name: Record Image Load Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 📥 Candidate Image Load
+        tool: Docker and SHA-256
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: load
+        success-label: VERIFIED
+        job-status: ${{ job.status }}
+        details: 'Verify archive checksum and exact loaded image ID before reuse.'

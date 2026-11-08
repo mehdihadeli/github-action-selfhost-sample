@@ -1,0 +1,60 @@
+name: Pipeline gate and evidence
+description: Evaluate required job outcomes and retain structured audit metadata without secrets.
+inputs:
+  stage-results:
+    description: toJSON(needs) from the calling job.
+    required: true
+  required-jobs:
+    description: Comma-separated jobs that must succeed; empty creates a report without a gate.
+    default: ''
+  name:
+    description: Artifact name and evidence prefix.
+    default: ci-evidence
+  image:
+    description: Verified image digest, when available.
+    default: ''
+  source-revision:
+    description: Application commit.
+    default: ${{ github.sha }}
+  configuration:
+    description: toJSON(inputs); only allowlisted test and scanner switches are retained.
+    default: '{}'
+  gitops-revision:
+    description: Exact desired-state commit for CD evidence.
+    default: ''
+outputs:
+  gate-status:
+    description: PASS, FAIL, or REPORT_ONLY.
+    value: ${{ steps.report.outputs.gate-status }}
+runs:
+  using: composite
+  steps:
+    - id: report
+      shell: bash
+      env:
+        STAGES: ${{ inputs.stage-results }}
+        REQUIRED: ${{ inputs.required-jobs }}
+        EVIDENCE_NAME: ${{ inputs.name }}
+        IMAGE: ${{ inputs.image }}
+        SOURCE_REVISION: ${{ inputs.source-revision }}
+        CONFIGURATION: ${{ inputs.configuration }}
+        GITOPS_REVISION: ${{ inputs.gitops-revision }}
+      run: python3 "$GITHUB_ACTION_PATH/evidence.py"
+    - if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: ${{ inputs.name }}
+        path: artifacts/${{ inputs.name }}/
+        if-no-files-found: error
+        retention-days: 30
+    - name: Record Pipeline Evidence Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 📋 Pipeline Evidence
+        tool: Outcome evaluation and artifact retention
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: report
+        job-status: ${{ job.status }}
+        report-only: ${{ inputs.required-jobs == '' }}
+        details: 'Required jobs must succeed; empty requirements produce evidence only. Retention is 30 days.'

@@ -1,0 +1,136 @@
+name: SBOM Generation (Trivy or Syft)
+description: Generate CycloneDX and SPDX JSON inventories with pinned Trivy or Syft; this is not a vulnerability gate.
+inputs:
+  generator:
+    description: SBOM generator, trivy or syft.
+    default: trivy
+  type:
+    description: fs for application output, or image for a loaded Docker image.
+    required: true
+  target:
+    description: Repository-relative directory or Docker image reference.
+    required: true
+  scope:
+    description: app or image evidence prefix.
+    required: true
+  output-directory:
+    description: Repository-relative inventory directory.
+    default: artifacts/security
+outputs:
+  cyclonedx:
+    description: Repository-relative CycloneDX JSON path.
+    value: ${{ steps.prepare.outputs.cyclonedx }}
+  spdx:
+    description: Repository-relative SPDX JSON path.
+    value: ${{ steps.prepare.outputs.spdx }}
+  table:
+    description: Repository-relative tab-separated dependency inventory.
+    value: ${{ steps.prepare.outputs.table }}
+runs:
+  using: composite
+  steps:
+    - name: Validate inventory target
+      id: prepare
+      shell: bash
+      env:
+        GENERATOR: ${{ inputs.generator }}
+        TYPE: ${{ inputs.type }}
+        TARGET: ${{ inputs.target }}
+        SCOPE: ${{ inputs.scope }}
+        OUTPUT_DIRECTORY: ${{ inputs.output-directory }}
+      run: |
+        if [[ "$GENERATOR" != trivy && "$GENERATOR" != syft ]]; then
+          echo '::error::generator must be trivy or syft.' >&2
+          exit 1
+        fi
+        [[ "$TYPE" == fs || "$TYPE" == image ]]
+        [[ "$SCOPE" == app || "$SCOPE" == image ]]
+        [[ -n "$TARGET" ]]
+        [[ "$OUTPUT_DIRECTORY" =~ ^[a-zA-Z0-9._/-]+$ ]]
+        [[ "$OUTPUT_DIRECTORY" != /* && "/$OUTPUT_DIRECTORY/" != */../* ]]
+        mkdir -p "$OUTPUT_DIRECTORY" artifacts/trivy-cache
+        echo "cyclonedx=$OUTPUT_DIRECTORY/$SCOPE.cdx.json" >> "$GITHUB_OUTPUT"
+        echo "spdx=$OUTPUT_DIRECTORY/$SCOPE.spdx.json" >> "$GITHUB_OUTPUT"
+        echo "table=$OUTPUT_DIRECTORY/$SCOPE.table.txt" >> "$GITHUB_OUTPUT"
+    - name: Generate CycloneDX inventory
+      id: cyclonedx
+      if: inputs.generator == 'trivy'
+      uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+      with:
+        version: v0.76.2
+        scan-type: ${{ inputs.type }}
+        scan-ref: ${{ inputs.target }}
+        image-ref: ${{ inputs.type == 'image' && inputs.target || '' }}
+        format: cyclonedx
+        output: ${{ steps.prepare.outputs.cyclonedx }}
+        cache-dir: artifacts/trivy-cache
+        timeout: 5m0s
+    - name: Generate SPDX inventory
+      id: spdx
+      if: inputs.generator == 'trivy'
+      uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+      with:
+        version: v0.76.2
+        skip-setup-trivy: 'true'
+        scan-type: ${{ inputs.type }}
+        scan-ref: ${{ inputs.target }}
+        image-ref: ${{ inputs.type == 'image' && inputs.target || '' }}
+        format: spdx-json
+        output: ${{ steps.prepare.outputs.spdx }}
+        cache-dir: artifacts/trivy-cache
+        timeout: 5m0s
+    - name: Generate CycloneDX and SPDX inventories with Syft
+      id: syft
+      if: inputs.generator == 'syft'
+      shell: bash
+      env:
+        TYPE: ${{ inputs.type }}
+        TARGET: ${{ inputs.target }}
+        SCOPE: ${{ inputs.scope }}
+        OUTPUT_DIRECTORY: ${{ inputs.output-directory }}
+      run: |
+        options=(--rm -v "$GITHUB_WORKSPACE:/src:ro"
+          -v "$GITHUB_WORKSPACE/$OUTPUT_DIRECTORY:/out" -w /src)
+        source="dir:/src/$TARGET"
+        if [[ "$TYPE" == image ]]; then
+          options+=(-v /var/run/docker.sock:/var/run/docker.sock)
+          source="docker:$TARGET"
+        fi
+        docker run "${options[@]}" anchore/syft:v1.57.0 "$source" \
+          -o "cyclonedx-json=/out/$SCOPE.cdx.json" \
+          -o "spdx-json=/out/$SCOPE.spdx.json"
+    - name: Generate readable dependency inventory
+      id: table
+      shell: bash
+      env:
+        CYCLONEDX: ${{ steps.prepare.outputs.cyclonedx }}
+        TABLE: ${{ steps.prepare.outputs.table }}
+      run: |
+        jq -r '["Name", "Version", "Type"], (.components[]? | [.name, .version, .type]) | @tsv' \
+          "$CYCLONEDX" > "$TABLE"
+    - name: Retain SBOM evidence
+      if: always() && steps.prepare.outcome == 'success'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: sbom-${{ inputs.scope }}
+        path: |
+          ${{ steps.prepare.outputs.cyclonedx }}
+          ${{ steps.prepare.outputs.spdx }}
+          ${{ steps.prepare.outputs.table }}
+        if-no-files-found: error
+        retention-days: 30
+    - name: Record SBOM Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 📜 Software Bill of Materials (SBOM)
+        tool: ${{ inputs.generator == 'syft' && 'Syft v1.57.0' || 'Trivy v0.76.2' }}
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: ${{ inputs.generator == 'syft' && 'prepare,syft,table' || 'prepare,cyclonedx,spdx,table' }}
+        success-label: GENERATED
+        job-status: ${{ job.status }}
+        details: |
+          - **Standard Formats:** SPDX JSON, CycloneDX JSON, and dependency table
+          - **Target:** ${{ inputs.target }}
+          - **Artifact:** GitHub Actions artifacts, 30 days retention
+          - **Scope:** Inventory generation; no signing or regulatory compliance claim

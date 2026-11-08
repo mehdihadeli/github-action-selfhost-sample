@@ -1,0 +1,74 @@
+name: Software Composition Analysis (Trivy SCA)
+description: Public SCA entry point to shared Trivy, Grype, and optional Snyk scan policy and evidence.
+inputs:
+  type:
+    description: fs or repo for checked-out files, or image for a loaded Docker image.
+    default: fs
+  target:
+    description: Repository-relative directory or local Docker image reference.
+    default: .
+  scope:
+    description: source, app, or image evidence prefix.
+    default: app
+  severity:
+    default: HIGH,CRITICAL
+  exit-code:
+    description: 1 enforces findings; 0 is explicit report-only mode. Scanner errors still fail.
+    default: '1'
+  scanners:
+    default: vuln,secret
+  skip-dirs:
+    default: .git,.catalog
+  trivyignores:
+    description: Optional comma-separated repository-relative Trivy ignore paths.
+    default: ''
+  enable-grype:
+    default: 'true'
+  enable-snyk:
+    description: Enable the independent HIGH+ Snyk gate for app or image scope.
+    default: 'false'
+  snyk-target:
+    description: Application csproj or image reference; empty uses target.
+    default: ''
+  snyk-token:
+    required: false
+  dockerfile:
+    default: Dockerfile
+  upload-sarif:
+    default: 'true'
+runs:
+  using: composite
+  steps:
+    - name: Scan dependencies with shared security policy
+      id: scan
+      uses: ./.catalog/.github/actions/security-scan
+      with:
+        type: ${{ inputs.type }}
+        target: ${{ inputs.target }}
+        scope: ${{ inputs.scope }}
+        severity: ${{ inputs.severity }}
+        exit-code: ${{ inputs.exit-code }}
+        scanners: ${{ inputs.scanners }}
+        skip-dirs: ${{ inputs.skip-dirs }}
+        trivyignores: ${{ inputs.trivyignores }}
+        enable-grype: ${{ inputs.enable-grype }}
+        enable-snyk: ${{ inputs.enable-snyk }}
+        snyk-target: ${{ inputs.snyk-target }}
+        snyk-token: ${{ inputs.snyk-token }}
+        dockerfile: ${{ inputs.dockerfile }}
+        upload-sarif: ${{ inputs.upload-sarif }}
+    - name: Record SCA Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 📦 Dependency SCA Audit
+        tool: Aqua Trivy, optional Grype and Snyk
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: scan
+        job-status: ${{ job.status }}
+        report-only: ${{ inputs.exit-code == '0' }}
+        details: |
+          - **Target:** ${{ inputs.target }}
+          - **Severities Monitored:** ${{ inputs.severity }}
+          - **Trivyignore Paths:** ${{ inputs.trivyignores || 'Default discovery' }}
+          - **Evidence:** CycloneDX and enabled scanner SARIF, 30 days retention

@@ -1,0 +1,76 @@
+githubConfigSecret: arc-github-auth
+runnerScaleSetName: arc-devsecops
+minRunners: 0
+maxRunners: 3
+controllerServiceAccount:
+  namespace: arc-systems
+  name: arc-controller
+containerMode: {}
+template:
+  spec:
+    automountServiceAccountToken: false
+    initContainers:
+      - name: init-dind-externals
+        image: devsecops-runner:2.338.2
+        imagePullPolicy: IfNotPresent
+        command: [cp, -r, /home/runner/externals/., /home/runner/tmpDir/]
+        volumeMounts:
+          - name: dind-externals
+            mountPath: /home/runner/tmpDir
+      - name: dind
+        image: docker:28.5.1-dind
+        restartPolicy: Always
+        args: [dockerd, '--host=unix:///var/run/docker.sock', '--group=123']
+        env:
+          - name: DOCKER_TLS_CERTDIR
+            value: ''
+        securityContext:
+          privileged: true
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: '2'
+            memory: 2Gi
+        startupProbe:
+          exec:
+            command: [docker, info]
+          periodSeconds: 5
+          failureThreshold: 24
+        volumeMounts:
+          - name: work
+            mountPath: /home/runner/_work
+          - name: dind-sock
+            mountPath: /var/run
+          - name: dind-externals
+            mountPath: /home/runner/externals
+    containers:
+      - name: runner
+        image: devsecops-runner:2.338.2
+        imagePullPolicy: IfNotPresent
+        command: [/home/runner/run.sh]
+        env:
+          - name: DOCKER_HOST
+            value: unix:///var/run/docker.sock
+          - name: RUNNER_WAIT_FOR_DOCKER_IN_SECONDS
+            value: '120'
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: '2'
+            memory: 2Gi
+        volumeMounts:
+          - name: work
+            mountPath: /home/runner/_work
+          - name: dind-sock
+            mountPath: /var/run
+    volumes:
+      - name: work
+        emptyDir: {}
+      - name: dind-sock
+        emptyDir: {}
+      - name: dind-externals
+        emptyDir: {}

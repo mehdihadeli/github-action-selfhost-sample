@@ -1,0 +1,42 @@
+name: Bounded k6 performance gate
+description: Run a caller-owned k6 scenario with mandatory thresholds against an authorized target.
+inputs:
+  url:
+    description: Authorized application URL passed as BASE_URL.
+    required: true
+  script:
+    description: Repository-relative k6 script with thresholds and bounded options.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      id: test
+      env:
+        URL: ${{ inputs.url }}
+        SCRIPT: ${{ inputs.script }}
+      run: |
+        [[ "$URL" == http://* || "$URL" == https://* ]]
+        [[ -f "$SCRIPT" ]]
+        mkdir -p artifacts/runtime
+        docker run --rm --user "$(id -u):$(id -g)" --network host \
+          -v "$GITHUB_WORKSPACE:/work" -w /work -e BASE_URL="$URL" \
+          grafana/k6:2.3.0 run --summary-export=artifacts/runtime/k6.json "$SCRIPT"
+        python3 - <<'PY'
+        import json, pathlib
+        data = json.loads(pathlib.Path('artifacts/runtime/k6.json').read_text())
+        thresholds = [value for metric in data['metrics'].values()
+                      for value in metric.get('thresholds', {}).values()]
+        if not thresholds:
+            raise SystemExit('k6 scenario must define enforceable thresholds.')
+        PY
+    - name: Record Performance Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 📈 Performance Gate
+        tool: k6
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: test
+        job-status: ${{ job.status }}
+        details: 'Require configured, enforceable performance thresholds.'

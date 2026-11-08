@@ -1,0 +1,85 @@
+name: Record action status
+description: Write an outcome-based Markdown status and configurable details to the GitHub job summary using Bash and jq.
+inputs:
+  title:
+    required: true
+  tool:
+    default: ''
+  details:
+    description: Additional Markdown detail lines; never pass secrets.
+    default: ''
+  step-results:
+    description: JSON step context; only outcomes are displayed, never outputs.
+    required: true
+  operation-steps:
+    description: Comma-separated step IDs that establish completion.
+    required: true
+  completion-mode:
+    description: all requires every operation; any supports alternative scan engines.
+    default: all
+  success-label:
+    default: COMPLETED
+  job-status:
+    default: success
+  enabled:
+    default: 'true'
+  report-only:
+    default: 'false'
+outputs:
+  status:
+    value: ${{ steps.record.outputs.status }}
+runs:
+  using: composite
+  steps:
+    - name: Record Action Status
+      id: record
+      if: always()
+      shell: bash
+      env:
+        TITLE: ${{ inputs.title }}
+        TOOL: ${{ inputs.tool }}
+        DETAILS: ${{ inputs.details }}
+        STEP_RESULTS: ${{ inputs.step-results }}
+        OPERATIONS: ${{ inputs.operation-steps }}
+        COMPLETION_MODE: ${{ inputs.completion-mode }}
+        SUCCESS_LABEL: ${{ inputs.success-label }}
+        JOB_STATUS: ${{ inputs.job-status }}
+        ENABLED: ${{ inputs.enabled }}
+        REPORT_ONLY: ${{ inputs.report-only }}
+      run: |
+        [[ "$ENABLED" == true || "$ENABLED" == false ]]
+        [[ "$REPORT_ONLY" == true || "$REPORT_ONLY" == false ]]
+        [[ "$COMPLETION_MODE" == all || "$COMPLETION_MODE" == any ]]
+        [[ "$SUCCESS_LABEL" =~ ^[A-Z_]+$ ]]
+        [[ -n "$OPERATIONS" ]]
+        outcomes="$(jq -ce 'if type == "object" then with_entries(.value = (.value.outcome // "unknown")) else error("Step results must be an object") end' <<< "$STEP_RESULTS")"
+        IFS=, read -r -a operations <<< "$OPERATIONS"
+        completed=0
+        for operation in "${operations[@]}"; do
+          if [[ "$(jq -r --arg operation "$operation" '.[$operation] // "missing"' <<< "$outcomes")" == success ]]; then
+            completed=$((completed + 1))
+          fi
+        done
+        status=NOT_RUN
+        if [[ "$ENABLED" == true ]] && { [[ "$COMPLETION_MODE" == all && "$completed" -eq "${#operations[@]}" ]] || [[ "$COMPLETION_MODE" == any && "$completed" -gt 0 ]]; }; then
+          status="$SUCCESS_LABEL"
+          [[ "$REPORT_ONLY" == false ]] || status=REPORT_ONLY
+        fi
+        if [[ "$JOB_STATUS" == failure ]] || jq -e 'any(.[]; . == "failure")' <<< "$outcomes" >/dev/null; then
+          status=FAIL
+        elif [[ "$JOB_STATUS" == cancelled ]] || jq -e 'any(.[]; . == "cancelled")' <<< "$outcomes" >/dev/null; then
+          status=CANCELLED
+        elif jq -e 'any(.[]; . != "success" and . != "skipped")' <<< "$outcomes" >/dev/null; then
+          status=UNKNOWN
+        fi
+        printf '### %s: %s\n' "$TITLE" "$status" >> "$GITHUB_STEP_SUMMARY"
+        if [[ -n "$TOOL" ]]; then
+          printf -- '- **Tool:** %s\n' "$TOOL" >> "$GITHUB_STEP_SUMMARY"
+        fi
+        if [[ -n "$DETAILS" ]]; then
+          printf '%s\n' "$DETAILS" >> "$GITHUB_STEP_SUMMARY"
+        fi
+        printf '\n| Step | Outcome |\n| --- | --- |\n' >> "$GITHUB_STEP_SUMMARY"
+        jq -r 'to_entries[] | "| \(.key | gsub("[\\r\\n|]"; " ")) | \(.value | gsub("[\\r\\n|]"; " ")) |"' <<< "$outcomes" >> "$GITHUB_STEP_SUMMARY"
+        printf '\n' >> "$GITHUB_STEP_SUMMARY"
+        echo "status=$status" >> "$GITHUB_OUTPUT"

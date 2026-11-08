@@ -1,0 +1,610 @@
+name: Reusable .NET CI
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: Project or solution to restore, format, and build.
+        required: true
+        type: string
+      publish-project:
+        description: Application csproj when project is a solution.
+        default: ''
+        type: string
+      test-project:
+        default: ''
+        type: string
+      test-platform:
+        default: vstest
+        type: string
+      e2e-test-project:
+        default: ''
+        type: string
+      e2e-test-platform:
+        default: vstest
+        type: string
+      require-tests:
+        default: false
+        type: boolean
+      collect-coverage:
+        default: false
+        type: boolean
+      dotnet-version:
+        default: 10.0.x
+        type: string
+      sbom-generator:
+        description: Image SBOM generator, trivy or syft; SCA inventories still use Trivy.
+        default: trivy
+        type: string
+      dockerfile:
+        default: Dockerfile
+        type: string
+      build-context:
+        default: '.'
+        type: string
+      platforms:
+        description: Single platform for the scanned candidate archive.
+        default: linux/amd64
+        type: string
+      registry:
+        default: ghcr.io
+        type: string
+      image-name:
+        description: Registry-relative image name; empty uses the caller repository.
+        default: ''
+        type: string
+      registry-username:
+        description: Registry login username; empty uses the GitHub actor.
+        default: ''
+        type: string
+      iac-directory:
+        default: deployments/gitops/environments/local
+        type: string
+      require-docker-healthcheck:
+        default: true
+        type: boolean
+      runner:
+        default: arc-devsecops
+        type: string
+      catalog-ref:
+        default: main
+        type: string
+      enable-snyk:
+        default: false
+        type: boolean
+      enable-sonar:
+        default: false
+        type: boolean
+      sonar-project-key:
+        default: ''
+        type: string
+      sonar-organization:
+        default: ''
+        type: string
+      sonar-host-url:
+        default: https://sonarcloud.io
+        type: string
+      enable-dependency-track:
+        default: false
+        type: boolean
+      dependency-track-url:
+        default: ''
+        type: string
+      signing-identity:
+        description: Exact identity of this signing workflow.
+        default: https://github.com/mehdihadeli/gha-workflows/.github/workflows/dotnet-ci.yml@refs/heads/main
+        type: string
+    secrets:
+      registry-token:
+        description: Push credentials for a non-GHCR registry; GHCR defaults to github.token.
+        required: false
+      gitleaks-license:
+        required: false
+      snyk-token:
+        required: false
+      sonar-token:
+        required: false
+      dependency-track-api-key:
+        required: false
+    outputs:
+      image:
+        description: Signed and verified immutable image; empty outside eligible main/tag push releases.
+        value: ${{ jobs.release.outputs.image }}
+      version:
+        description: Calculated release version; empty for non-release refs.
+        value: ${{ jobs.calculate-version.outputs.version }}
+      assembly_version:
+        description: NBGV assembly version.
+        value: ${{ jobs.calculate-version.outputs.assembly_version }}
+      informational_version:
+        description: Version with source commit metadata.
+        value: ${{ jobs.calculate-version.outputs.informational_version }}
+      docker_tag:
+        description: Docker-compatible release tag.
+        value: ${{ jobs.calculate-version.outputs.docker_tag }}
+      environment:
+        description: dev, staging, production, or none; empty for non-release refs.
+        value: ${{ jobs.calculate-version.outputs.environment }}
+      commit:
+        description: Short source commit SHA.
+        value: ${{ jobs.calculate-version.outputs.commit }}
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: .NET Code Quality & Dockerfile Audit
+    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    steps:
+      - &source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - &catalog
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: mehdihadeli/gha-workflows
+          ref: ${{ inputs.catalog-ref }}
+          path: .catalog
+          persist-credentials: false
+      - uses: ./.catalog/.github/actions/dotnet-setup
+        with:
+          project: ${{ inputs.project }}
+          dotnet-version: ${{ inputs.dotnet-version }}
+      - uses: ./.catalog/.github/actions/dotnet-quality
+        with:
+          project: ${{ inputs.project }}
+      - uses: ./.catalog/.github/actions/hadolint
+        with:
+          dockerfile: ${{ inputs.dockerfile }}
+
+  secret-scan:
+    name: Secret Leak Detection (Gitleaks)
+    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+      security-events: write
+    steps:
+      - *source
+      - *catalog
+      - uses: ./.catalog/.github/actions/secret-scan
+        with:
+          fail-on-leak: 'true'
+          gitleaks-license: ${{ secrets.gitleaks-license }}
+          upload-sarif: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
+  sast-scan:
+    name: SAST Code Analysis (Semgrep)
+    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - *source
+      - *catalog
+      - uses: ./.catalog/.github/actions/sast-scan
+        with:
+          upload-sarif: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
+  sca-scan:
+    name: Pre-Build Source Dependency Audit (Trivy)
+    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - *source
+      - *catalog
+      - name: Scan repository dependencies, secrets and configuration before build (artifacts excluded)
+        uses: ./.catalog/.github/actions/sca-scan
+        with:
+          type: fs
+          target: .
+          scope: source
+          scanners: vuln,secret,misconfig
+          skip-dirs: .git,.catalog,artifacts
+          exit-code: '1'
+          enable-grype: 'false'
+          upload-sarif: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
+  iac-scan:
+    name: IaC Security Scan (Checkov)
+    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - *source
+      - *catalog
+      - uses: ./.catalog/.github/actions/iac-scan
+        with:
+          directory: ${{ inputs.iac-directory }}
+          dockerfile: ${{ inputs.dockerfile }}
+          require-docker-healthcheck: ${{ inputs.require-docker-healthcheck }}
+          soft-fail: 'false'
+          enable-snyk: ${{ inputs.enable-snyk }}
+          snyk-token: ${{ secrets.snyk-token }}
+          upload-sarif: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: iac-security-evidence
+          path: artifacts/security/
+          if-no-files-found: error
+          retention-days: 30
+
+  codeql:
+    name: SAST Code Analysis (CodeQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - *source
+      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066
+        with:
+          languages: csharp
+          build-mode: none
+          queries: security-extended
+      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066
+
+  pre-build-gate:
+    name: Pre-Build Security Gate
+    needs: [quality, secret-scan, sast-scan, sca-scan, iac-scan, codeql]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - *catalog
+      - uses: ./.catalog/.github/actions/pipeline-evidence
+        with:
+          stage-results: ${{ toJSON(needs) }}
+          required-jobs: quality,secret-scan,sast-scan,sca-scan,iac-scan,codeql
+          name: pre-build-gate-evidence
+
+  build-test:
+    name: .NET Build & Test
+    needs: pre-build-gate
+    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    steps:
+      - *source
+      - *catalog
+      - uses: ./.catalog/.github/actions/dotnet-setup
+        with:
+          project: ${{ inputs.project }}
+          dotnet-version: ${{ inputs.dotnet-version }}
+      - uses: ./.catalog/.github/actions/dotnet-build
+        with:
+          project: ${{ inputs.project }}
+      - name: Require configured tests
+        if: inputs.require-tests && inputs.test-project == '' && inputs.e2e-test-project == ''
+        run: echo 'At least one test suite is required.' >&2; exit 1
+      - uses: ./.catalog/.github/actions/dotnet-test
+        with:
+          project: ${{ inputs.test-project }}
+          platform: ${{ inputs.test-platform }}
+          results-directory: artifacts/tests/unit
+          collect-coverage: ${{ inputs.collect-coverage }}
+      - uses: ./.catalog/.github/actions/dotnet-test
+        with:
+          project: ${{ inputs.e2e-test-project }}
+          platform: ${{ inputs.e2e-test-platform }}
+          results-directory: artifacts/tests/e2e
+      - if: always() && (inputs.test-project != '' || inputs.e2e-test-project != '')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dotnet-test-evidence
+          path: artifacts/tests/
+          if-no-files-found: error
+          retention-days: 30
+
+  sonar:
+    name: Code Quality Gate (Sonar)
+    needs: build-test
+    if: inputs.enable-sonar
+    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    steps:
+      - *source
+      - *catalog
+      - uses: ./.catalog/.github/actions/dotnet-setup
+        with:
+          project: ${{ inputs.project }}
+          dotnet-version: ${{ inputs.dotnet-version }}
+      - if: inputs.test-project != '' || inputs.e2e-test-project != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: dotnet-test-evidence
+          path: artifacts/tests
+      - uses: ./.catalog/.github/actions/sonar
+        with:
+          project: ${{ inputs.project }}
+          project-key: ${{ inputs.sonar-project-key }}
+          organization: ${{ inputs.sonar-organization }}
+          host-url: ${{ inputs.sonar-host-url }}
+          token: ${{ secrets.sonar-token }}
+
+  sca-scan-app:
+    name: Post-Publish Application SCA & SBOM (Trivy & Grype)
+    needs: build-test
+    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - *source
+      - *catalog
+      - uses: ./.catalog/.github/actions/dotnet-setup
+        with:
+          project: ${{ inputs.project }}
+          dotnet-version: ${{ inputs.dotnet-version }}
+      - name: Publish application files for artifact scanning
+        uses: ./.catalog/.github/actions/dotnet-publish
+        with:
+          project: ${{ inputs.publish-project || inputs.project }}
+      - name: Scan published files with Trivy/Grype and generate SBOM (optional Snyk audits restored NuGet assets)
+        uses: ./.catalog/.github/actions/sca-scan
+        with:
+          type: fs
+          target: artifacts/publish
+          scope: app
+          exit-code: '1'
+          enable-grype: 'true'
+          enable-snyk: ${{ inputs.enable-snyk }}
+          snyk-target: ${{ inputs.publish-project || inputs.project }}
+          snyk-token: ${{ secrets.snyk-token }}
+          upload-sarif: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - uses: ./.catalog/.github/actions/dependency-track
+        with:
+          enabled: ${{ inputs.enable-dependency-track }}
+          url: ${{ inputs.dependency-track-url }}
+          api-key: ${{ secrets.dependency-track-api-key }}
+          bom: artifacts/security/app.cdx.json
+          project-name: ${{ github.repository }}
+          project-version: ${{ github.sha }}
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: app-security-evidence
+          path: artifacts/security/
+          if-no-files-found: error
+          retention-days: 30
+
+  calculate-version:
+    name: Calculate Release Version (NBGV)
+    needs: build-test
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      assembly_version: ${{ steps.version.outputs.assembly_version }}
+      informational_version: ${{ steps.version.outputs.informational_version }}
+      docker_tag: ${{ steps.version.outputs.docker_tag }}
+      environment: ${{ steps.version.outputs.environment }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - *source
+      - *catalog
+      - id: version
+        uses: ./.catalog/.github/actions/calculate-version
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+  image-build:
+    name: Container Image Build
+    needs: [build-test, calculate-version]
+    if: ${{ !cancelled() && needs.build-test.result == 'success' && (needs.calculate-version.result == 'success' || needs.calculate-version.result == 'skipped') }}
+    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    outputs:
+      tag: ${{ steps.build.outputs.tag }}
+      image-id: ${{ steps.build.outputs.image-id }}
+      archive-sha256: ${{ steps.build.outputs.archive-sha256 }}
+    steps:
+      - *source
+      - *catalog
+      - id: build
+        uses: ./.catalog/.github/actions/docker-image-build
+        with:
+          context: ${{ inputs.build-context }}
+          dockerfile: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          registry: ${{ inputs.registry }}
+          image-name: ${{ inputs.image-name || github.repository }}
+          registry-username: ${{ inputs.registry-username || github.actor }}
+          registry-token: ${{ github.event_name == 'push' && secrets.registry-token || '' }}
+          docker-tag: ${{ needs.calculate-version.outputs.docker_tag }}
+          publish-latest: ${{ needs.calculate-version.outputs.environment == 'production' }}
+
+  container-security:
+    name: Container Image Scan (Trivy & Grype)
+    needs: image-build
+    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - *source
+      - *catalog
+      - uses: ./.catalog/.github/actions/image-load
+        with:
+          tag: ${{ needs.image-build.outputs.tag }}
+          image-id: ${{ needs.image-build.outputs.image-id }}
+          archive-sha256: ${{ needs.image-build.outputs.archive-sha256 }}
+      - name: Scan Container Image with Trivy
+        uses: ./.catalog/.github/actions/container-scan
+        with:
+          image-ref: ${{ needs.image-build.outputs.tag }}
+          exit-code: '1'
+          enable-grype: 'true'
+          enable-snyk: ${{ inputs.enable-snyk }}
+          snyk-token: ${{ secrets.snyk-token }}
+          dockerfile: ${{ inputs.dockerfile }}
+          artifact-name: image-security-evidence
+          upload-sarif: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
+  supply-chain-security:
+    name: Image SBOM Generation (${{ inputs.sbom-generator == 'syft' && 'Syft' || 'Trivy' }})
+    needs: [image-build, container-security]
+    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    steps:
+      - *catalog
+      - uses: ./.catalog/.github/actions/image-load
+        with:
+          tag: ${{ needs.image-build.outputs.tag }}
+          image-id: ${{ needs.image-build.outputs.image-id }}
+          archive-sha256: ${{ needs.image-build.outputs.archive-sha256 }}
+      - uses: ./.catalog/.github/actions/sbom-generator
+        with:
+          generator: ${{ inputs.sbom-generator }}
+          type: image
+          target: ${{ needs.image-build.outputs.tag }}
+          scope: image
+
+  security-gate:
+    name: Release Security Gate
+    needs: [quality, secret-scan, sast-scan, sca-scan, iac-scan, codeql, pre-build-gate, build-test, sonar, sca-scan-app, calculate-version, image-build, container-security, supply-chain-security]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - *catalog
+      - uses: ./.catalog/.github/actions/pipeline-evidence
+        with:
+          stage-results: ${{ toJSON(needs) }}
+          required-jobs: quality,secret-scan,sast-scan,sca-scan,iac-scan,codeql,pre-build-gate,build-test,sca-scan-app,image-build,container-security,supply-chain-security${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && ',calculate-version' || '' }}${{ inputs.enable-sonar && ',sonar' || '' }}
+          name: security-gate-evidence
+          configuration: ${{ toJSON(inputs) }}
+
+  release:
+    name: Image Publication, Signing & Attestation
+    needs: [security-gate, image-build, calculate-version]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && needs.calculate-version.outputs.environment != 'none'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      image: ${{ steps.complete.outputs.image }}
+    steps:
+      - *catalog
+      - uses: ./.catalog/.github/actions/image-load
+        with:
+          tag: ${{ needs.image-build.outputs.tag }}
+          image-id: ${{ needs.image-build.outputs.image-id }}
+          archive-sha256: ${{ needs.image-build.outputs.archive-sha256 }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: sbom-image
+          path: artifacts/security
+      - id: publish
+        uses: ./.catalog/.github/actions/docker-image-push
+        with:
+          tag: ${{ needs.image-build.outputs.tag }}
+          registry: ${{ inputs.registry }}
+          image-name: ${{ inputs.image-name || github.repository }}
+          registry-username: ${{ inputs.registry-username || github.actor }}
+          registry-token: ${{ secrets.registry-token || (inputs.registry == 'ghcr.io' && github.token) || '' }}
+          docker-tag: ${{ needs.calculate-version.outputs.docker_tag }}
+          publish-latest: ${{ needs.calculate-version.outputs.environment == 'production' }}
+      - uses: ./.catalog/.github/actions/image-signer
+        with:
+          image-ref: ${{ steps.publish.outputs.image }}
+          registry: ${{ inputs.registry }}
+          image-name: ${{ inputs.image-name || github.repository }}
+          enable-attestation: 'true'
+          sbom-path: artifacts/security/image.cdx.json
+          attestation-type: cyclonedx
+          source-revision: ${{ github.sha }}
+          source-ref: ${{ github.ref }}
+          signing-identity: ${{ inputs.signing-identity }}
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-name: ${{ steps.publish.outputs.repository }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+      - id: complete
+        env:
+          IMAGE: ${{ steps.publish.outputs.image }}
+        run: echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+  devsecops-scorecard:
+    name: DevSecOps Quality Gate Scorecard
+    needs: [quality, secret-scan, sast-scan, sca-scan, iac-scan, codeql, pre-build-gate, build-test, sonar, sca-scan-app, calculate-version, image-build, container-security, supply-chain-security, security-gate, release]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - *catalog
+      - uses: ./.catalog/.github/actions/pipeline-evidence
+        with:
+          stage-results: ${{ toJSON(needs) }}
+          image: ${{ needs.release.outputs.image }}
+          configuration: ${{ toJSON(inputs) }}
+      - name: Generate Unified Executive Summary
+        if: always()
+        shell: bash
+        env:
+          STAGES: ${{ toJSON(needs) }}
+          IMAGE: ${{ needs.release.outputs.image }}
+          ENABLE_SNYK: ${{ inputs.enable-snyk }}
+          ENABLE_SONAR: ${{ inputs.enable-sonar }}
+          VERSION: ${{ needs.calculate-version.outputs.version }}
+          RELEASE_ENVIRONMENT: ${{ needs.calculate-version.outputs.environment }}
+        run: |
+          printf '## 🛡️ DevSecOps Shift-Left Quality Gate Scorecard\n\n' >> "$GITHUB_STEP_SUMMARY"
+          printf '| Quality Gate | Tool | Target | Status | Enforced Policy |\n|:---|:---|:---|:---|:---|\n' >> "$GITHUB_STEP_SUMMARY"
+          while IFS='|' read -r gate tool target policy job; do
+            result="$(jq -r --arg job "$job" '.[$job].result // "unknown"' <<< "$STAGES")"
+            case "$result" in
+              success)
+                case "$job" in
+                  calculate-version) status='✅ CALCULATED' ;;
+                  supply-chain-security) status='✅ GENERATED' ;;
+                  release) status='✅ VERIFIED' ;;
+                  *) status='✅ PASSED' ;;
+                esac
+                ;;
+              failure) status='❌ FAIL' ;;
+              cancelled) status='🚫 CANCELLED' ;;
+              skipped) status='⏭️ NOT_RUN' ;;
+              *) status='❓ UNKNOWN' ;;
+            esac
+            printf '| **%s** | %s | %s | %s | %s |\n' "$gate" "$tool" "$target" "$status" "$policy" >> "$GITHUB_STEP_SUMMARY"
+          done <<'GATES'
+          Code Quality|dotnet format / CSharpier / Roslyn / Hadolint|Source and Dockerfile|Style, formatting, analyzer warnings and warning-level lint|quality
+          Release Version|Nerdbank.GitVersioning|Root version.json and Git History|Validated SemVer, release tag and target environment|calculate-version
+          Secret Detection|Gitleaks v8|Git History|Zero unencrypted credentials|secret-scan
+          SAST Analysis|Semgrep OSS|Source Code|Configured OWASP and security audit rules|sast-scan
+          Dependency SCA|Aqua Trivy|Manifests and Lockfiles|HIGH and CRITICAL findings|sca-scan
+          IaC Hardening|Checkov / optional Snyk|Rendered Kubernetes, Dockerfile and Workflows|Configured policies and reviewed exceptions|iac-scan
+          Container Security|Trivy / Grype / optional Snyk|Immutable Candidate Image|HIGH and CRITICAL findings|container-security
+          Supply Chain (SBOM)|${{ inputs.sbom-generator == 'syft' && 'Anchore Syft' || 'Aqua Trivy' }}|Candidate Image|CycloneDX, SPDX JSON and inventory|supply-chain-security
+          Integrity Signing|Sigstore Cosign / GitHub|Image Digest and Attestations|Exact GitHub OIDC identity, SBOM attestation and provenance|release
+          GATES
+          printf '\n- **Snyk enabled:** %s\n- **Sonar enabled:** %s\n' "$ENABLE_SNYK" "$ENABLE_SONAR" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -n "$VERSION" ]]; then
+            printf -- '- **Release version:** `%s`\n- **Target environment:** %s\n' "$VERSION" "$RELEASE_ENVIRONMENT" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ -n "$IMAGE" ]]; then
+            printf -- '- **Released image:** `%s`\n' "$IMAGE" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          printf '\n> **SARIF Integration:** Scanner actions publish detailed findings to **Security → Code Scanning** when uploads are enabled and permitted.\n' >> "$GITHUB_STEP_SUMMARY"
+          printf '\nSkipped stages are not successes. No compliance certification or SLSA level is claimed.\n' >> "$GITHUB_STEP_SUMMARY"

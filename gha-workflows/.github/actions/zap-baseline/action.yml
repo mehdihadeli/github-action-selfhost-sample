@@ -1,0 +1,30 @@
+name: Passive ZAP baseline gate
+description: Spider an authorized target and fail on warnings, findings, or scanner errors.
+inputs:
+  url:
+    description: Authorized deployed target URL.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      id: scan
+      env:
+        URL: ${{ inputs.url }}
+      run: |
+        [[ "$URL" == http://* || "$URL" == https://* ]]
+        mkdir -p artifacts/runtime/zap
+        docker run --rm --user "$(id -u):$(id -g)" --network host \
+          -v "$GITHUB_WORKSPACE/artifacts/runtime/zap:/zap/wrk:rw" \
+          ghcr.io/zaproxy/zaproxy:2.17.0 zap-baseline.py -t "$URL" \
+          -m 1 -T 5 -J report.json -r report.html
+    - name: Record DAST Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 🕷️ Passive DAST
+        tool: OWASP ZAP
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: scan
+        job-status: ${{ job.status }}
+        details: 'Bounded passive baseline scan against the configured deployed URL.'

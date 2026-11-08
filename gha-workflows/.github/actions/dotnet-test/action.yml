@@ -1,0 +1,78 @@
+name: .NET test validation
+description: Run an explicitly selected .NET test platform and fail on zero discovered tests.
+inputs:
+  project:
+    description: Test project path; empty explicitly reports no suite configured.
+    default: ''
+  platform:
+    description: vstest, mtp, or mtp-bridge. Must match the consuming project's configuration.
+    default: vstest
+  results-directory:
+    description: Repository-relative test evidence directory.
+    default: artifacts/tests
+  collect-coverage:
+    description: Enable the configured VSTest XPlat Code Coverage collector.
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Execute configured test suite
+      id: test
+      shell: bash
+      env:
+        PROJECT: ${{ inputs.project }}
+        PLATFORM: ${{ inputs.platform }}
+        RESULTS: ${{ inputs.results-directory }}
+        COVERAGE: ${{ inputs.collect-coverage }}
+      run: |
+        if [[ -z "$PROJECT" ]]; then
+          echo '::notice::No .NET test suite configured. This is not a passing unit-test result.'
+          exit 0
+        fi
+        mkdir -p "$RESULTS"
+        RESULTS="$(mktemp -d "$RESULTS/run.XXXXXX")"
+        export RESULTS
+        dotnet restore "$PROJECT" --locked-mode
+        case "$PLATFORM" in
+          vstest)
+            args=(--logger trx --results-directory "$RESULTS")
+            if [[ "$COVERAGE" == true ]]; then
+              args+=(--collect 'XPlat Code Coverage' -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=opencover,cobertura)
+            fi
+            dotnet test "$PROJECT" --configuration Release --no-restore "${args[@]}"
+            ;;
+          mtp)
+            [[ "$COVERAGE" == false ]] || { echo 'Use repository-configured MTP coverage instead of a VSTest collector.' >&2; exit 1; }
+            dotnet test --project "$PROJECT" --configuration Release --no-restore \
+              --report-trx --results-directory "$RESULTS"
+            ;;
+          mtp-bridge)
+            [[ "$COVERAGE" == false ]] || { echo 'Use repository-configured MTP coverage instead of a VSTest collector.' >&2; exit 1; }
+            dotnet test "$PROJECT" --configuration Release --no-restore -- \
+              --report-trx --results-directory "$RESULTS"
+            ;;
+          *) echo "Unsupported test platform: $PLATFORM" >&2; exit 1 ;;
+        esac
+        python3 - <<'PY'
+        import os
+        import pathlib
+        import xml.etree.ElementTree as ET
+        reports = list(pathlib.Path(os.environ['RESULTS']).rglob('*.trx'))
+        count = sum(int(node.attrib['total']) for report in reports
+                    for node in ET.parse(report).iter()
+                    if node.tag.endswith('Counters'))
+        if count == 0:
+            raise SystemExit('Configured test project discovered zero tests or produced no TRX evidence.')
+        print(f'Executed {count} tests.')
+        PY
+    - name: Record Test Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 🧪 .NET Tests
+        tool: .NET test runner
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: test
+        job-status: ${{ job.status }}
+        enabled: ${{ inputs.project != '' }}
+        details: 'Configured suite must discover tests and retain valid TRX evidence.'

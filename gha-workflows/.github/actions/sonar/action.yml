@@ -1,0 +1,59 @@
+name: Optional Sonar quality gate
+description: Run .NET analysis with test evidence and wait for the server quality gate.
+inputs:
+  project:
+    description: Restored application project or solution.
+    required: true
+  project-key:
+    description: Sonar project key.
+    required: true
+  organization:
+    description: Required for SonarCloud, empty for self-managed SonarQube.
+    default: ''
+  host-url:
+    description: Sonar server URL.
+    default: https://sonarcloud.io
+  token:
+    description: Sonar analysis token.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Analyze and enforce quality gate
+      id: analyze
+      shell: bash
+      env:
+        PROJECT: ${{ inputs.project }}
+        PROJECT_KEY: ${{ inputs.project-key }}
+        ORGANIZATION: ${{ inputs.organization }}
+        SONAR_HOST: ${{ inputs.host-url }}
+        SONAR_TOKEN: ${{ inputs.token }}
+        DOTNET_ROLL_FORWARD: LatestMajor
+      run: |
+        : "${SONAR_TOKEN:?Sonar enabled but token is missing.}"
+        : "${PROJECT_KEY:?Sonar project key is required.}"
+        if [[ "$SONAR_HOST" == https://sonarcloud.io && -z "$ORGANIZATION" ]]; then
+          echo 'SonarCloud organization is required.' >&2
+          exit 1
+        fi
+        scanner="$RUNNER_TEMP/sonar-scanner"
+        dotnet tool install --tool-path "$scanner" dotnet-sonarscanner --version 12.1.0
+        args=("/k:$PROJECT_KEY" "/d:sonar.host.url=$SONAR_HOST" "/d:sonar.token=$SONAR_TOKEN"
+          "/d:sonar.projectBaseDir=$GITHUB_WORKSPACE" '/d:sonar.exclusions=.catalog/**,artifacts/**'
+          /d:sonar.qualitygate.wait=true /d:sonar.qualitygate.timeout=600
+          '/d:sonar.cs.vstest.reportsPaths=artifacts/tests/**/*.trx'
+          '/d:sonar.cs.opencover.reportsPaths=artifacts/tests/**/coverage.opencover.xml')
+        if [[ -n "$ORGANIZATION" ]]; then args+=("/o:$ORGANIZATION"); fi
+        "$scanner/dotnet-sonarscanner" begin "${args[@]}"
+        trap 'status=$?; trap - EXIT; if ! "$scanner/dotnet-sonarscanner" end "/d:sonar.token=$SONAR_TOKEN"; then status=1; fi; exit "$status"' EXIT
+        dotnet build "$PROJECT" --configuration Release --no-restore --no-incremental
+    - name: Record Sonar Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 🔍 Code Quality Gate
+        tool: Sonar
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: analyze
+        job-status: ${{ job.status }}
+        details: 'Run analysis and wait for the configured quality gate; missing token fails.'

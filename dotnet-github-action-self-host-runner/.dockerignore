@@ -1,0 +1,9 @@
+.git
+.github
+.catalog
+.gitops
+**/bin
+**/obj
+deployments
+artifacts
+README.md

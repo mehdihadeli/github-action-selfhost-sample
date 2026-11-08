@@ -1,0 +1,520 @@
+name: Reusable .NET CD
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: CI version for metadata; never used to reconstruct the image.
+        type: string
+        default: ''
+      image:
+        description: Verified immutable image from dotnet-ci.
+        type: string
+        required: true
+      registry:
+        type: string
+        default: ghcr.io
+      image-name:
+        description: Registry-relative image name; empty uses the caller repository.
+        type: string
+        default: ''
+      registry-username:
+        type: string
+        default: ''
+      source-revision:
+        type: string
+        required: true
+      source-ref:
+        description: Exact signed source ref; main or a stable/RC release tag.
+        type: string
+        default: refs/heads/main
+      repo-url:
+        type: string
+        required: true
+      username:
+        type: string
+        required: true
+      branch:
+        type: string
+        default: main
+      manifest-path:
+        type: string
+        default: environments/local/kustomization.yaml
+      image-key:
+        type: string
+        default: simple-api
+      environment:
+        type: string
+        default: local
+      runner:
+        type: string
+        default: arc-devsecops
+      catalog-ref:
+        type: string
+        default: main
+      signing-identity:
+        type: string
+        default: https://github.com/mehdihadeli/gha-workflows/.github/workflows/dotnet-ci.yml@refs/heads/main
+      validate-deployment:
+        description: Enable exact-revision reconciliation and runtime validation.
+        type: boolean
+        default: false
+      argocd-server:
+        type: string
+        default: ''
+      argocd-application:
+        type: string
+        default: simple-api-local
+      argocd-ca-file:
+        type: string
+        default: ''
+      argocd-allow-http:
+        description: Isolated local lab only.
+        type: boolean
+        default: false
+      application-url:
+        type: string
+        default: ''
+      health-path:
+        type: string
+        default: /health
+      api-path:
+        type: string
+        default: /weatherforecast
+      json-kind:
+        type: string
+        default: array
+      enable-k6:
+        type: boolean
+        default: false
+      k6-script:
+        type: string
+        default: deployments/validation/smoke-load.js
+      enable-zap:
+        description: Passive baseline against an authorized target only.
+        type: boolean
+        default: false
+      enable-rollback:
+        description: Restore the previous verified digest after failed deployment checks.
+        type: boolean
+        default: false
+    secrets:
+      registry-token:
+        description: Pull credentials for a non-GHCR registry; GHCR defaults to github.token.
+        required: false
+      gitops-token:
+        required: true
+      argocd-token:
+        required: false
+      slack-webhook-url:
+        description: Optional Slack incoming webhook for deployment failure notifications.
+        required: false
+    outputs:
+      gitops-revision:
+        description: Exact desired-state commit; empty for stale source builds.
+        value: ${{ jobs.deploy.outputs.revision }}
+      promotion-status:
+        value: ${{ jobs.deploy.outputs.status }}
+      validated:
+        description: true only after every enabled deployment check succeeds.
+        value: ${{ jobs.runtime.outputs.validated || 'false' }}
+      rollback-status:
+        description: rolled-back only after restore, exact reconciliation and smoke pass.
+        value: ${{ jobs.rollback.outputs.status || 'not-run' }}
+      rollback-revision:
+        description: Recovery GitOps commit, when one was pushed.
+        value: ${{ jobs.rollback.outputs.revision }}
+
+permissions: {}
+concurrency:
+  group: gitops-${{ github.repository }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare Deployment
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Validate deployment parameters
+        shell: bash
+        env:
+          IMAGE: ${{ inputs.image }}
+          REGISTRY: ${{ inputs.registry }}
+          IMAGE_NAME: ${{ inputs.image-name || github.repository }}
+          SOURCE_REVISION: ${{ inputs.source-revision }}
+          SOURCE_REF: ${{ inputs.source-ref }}
+          EXPECTED_REVISION: ${{ github.sha }}
+          EXPECTED_REF: ${{ github.ref }}
+          VALIDATE_DEPLOYMENT: ${{ inputs.validate-deployment }}
+          ENABLE_K6: ${{ inputs.enable-k6 }}
+          ENABLE_ZAP: ${{ inputs.enable-zap }}
+          ENABLE_ROLLBACK: ${{ inputs.enable-rollback }}
+          ARGOCD_SERVER: ${{ inputs.argocd-server }}
+          ARGOCD_TOKEN: ${{ secrets.argocd-token }}
+          APPLICATION_URL: ${{ inputs.application-url }}
+        run: |
+          [[ "$SOURCE_REVISION" == "$EXPECTED_REVISION" && "$SOURCE_REVISION" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$SOURCE_REF" == "$EXPECTED_REF" ]]
+          release_number='(0|[1-9][0-9]*)'
+          tag_pattern="^refs/tags/v${release_number}\\.${release_number}\\.${release_number}(-rc\\.${release_number})?$"
+          [[ "$SOURCE_REF" == refs/heads/main || "$SOURCE_REF" =~ $tag_pattern ]]
+          registry="${REGISTRY,,}"
+          image_name="${IMAGE_NAME,,}"
+          [[ "$IMAGE" == "$registry/$image_name@sha256:"* ]]
+          [[ "${IMAGE#*@sha256:}" =~ ^[a-f0-9]{64}$ ]]
+          if [[ "$VALIDATE_DEPLOYMENT" != true && ( "$ENABLE_K6" == true || "$ENABLE_ZAP" == true || "$ENABLE_ROLLBACK" == true ) ]]; then
+            echo '::error::Runtime scanners and rollback require validate-deployment=true.' >&2
+            exit 1
+          fi
+          if [[ "$VALIDATE_DEPLOYMENT" == true && ( -z "$ARGOCD_SERVER" || -z "$ARGOCD_TOKEN" || -z "$APPLICATION_URL" ) ]]; then
+            echo '::error::Deployment validation requires argocd-server, argocd-token and application-url.' >&2
+            exit 1
+          fi
+
+  verify:
+    name: Verify Image & SBOM
+    needs: prepare
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      image: ${{ steps.verified.outputs.image }}
+    steps:
+      - &catalog
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: mehdihadeli/gha-workflows
+          ref: ${{ inputs.catalog-ref }}
+          path: .catalog
+          persist-credentials: false
+      - name: Log in to image registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ inputs.registry-username || github.actor }}
+          password: ${{ secrets.registry-token || (inputs.registry == 'ghcr.io' && github.token) || '' }}
+      - uses: ./.catalog/.github/actions/verify-image
+        with:
+          image: ${{ inputs.image }}
+          registry: ${{ inputs.registry }}
+          image-name: ${{ inputs.image-name || github.repository }}
+          source-revision: ${{ inputs.source-revision }}
+          source-ref: ${{ inputs.source-ref }}
+          signing-identity: ${{ inputs.signing-identity }}
+      - id: verified
+        shell: bash
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    needs: [prepare, verify]
+    runs-on: ${{ inputs.runner }}
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      revision: ${{ steps.promote.outputs.revision }}
+      status: ${{ steps.promote.outputs.status }}
+    steps:
+      - *catalog
+      - uses: ./.catalog/.github/actions/promote-gitops
+        id: promote
+        with:
+          image: ${{ needs.verify.outputs.image }}
+          registry: ${{ inputs.registry }}
+          image-name: ${{ inputs.image-name || github.repository }}
+          registry-username: ${{ inputs.registry-username || github.actor }}
+          registry-token: ${{ secrets.registry-token }}
+          source-revision: ${{ inputs.source-revision }}
+          source-ref: ${{ inputs.source-ref }}
+          signing-identity: ${{ inputs.signing-identity }}
+          repo-url: ${{ inputs.repo-url }}
+          branch: ${{ inputs.branch }}
+          manifest-path: ${{ inputs.manifest-path }}
+          image-key: ${{ inputs.image-key }}
+          username: ${{ inputs.username }}
+          token: ${{ secrets.gitops-token }}
+      - name: Report promotion-only mode
+        if: '!inputs.validate-deployment'
+        run: echo '::notice::Desired state promoted only. Argo readiness and runtime checks are disabled; deployment success is not claimed.'
+
+  wait-sync:
+    name: Wait for Argo CD Sync
+    needs: deploy
+    if: inputs.validate-deployment && needs.deploy.outputs.status != 'stale' && needs.deploy.outputs.revision != ''
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - &source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - *catalog
+      - uses: ./.catalog/.github/actions/argocd-wait
+        with:
+          server: ${{ inputs.argocd-server }}
+          application: ${{ inputs.argocd-application }}
+          revision: ${{ needs.deploy.outputs.revision }}
+          image: ${{ inputs.image }}
+          token: ${{ secrets.argocd-token }}
+          ca-file: ${{ inputs.argocd-ca-file }}
+          allow-http: ${{ inputs.argocd-allow-http }}
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: reconciliation-evidence-${{ inputs.environment }}
+          path: artifacts/runtime/
+          if-no-files-found: error
+          retention-days: 30
+
+  smoke-tests:
+    name: Smoke Tests
+    needs: wait-sync
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - *catalog
+      - uses: ./.catalog/.github/actions/http-smoke
+        with:
+          url: ${{ inputs.application-url }}
+          health-path: ${{ inputs.health-path }}
+          api-path: ${{ inputs.api-path }}
+          json-kind: ${{ inputs.json-kind }}
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: smoke-evidence-${{ inputs.environment }}
+          path: artifacts/runtime/
+          if-no-files-found: error
+          retention-days: 30
+
+  load:
+    name: Load Tests (k6)
+    needs: smoke-tests
+    if: inputs.enable-k6
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - *source
+      - *catalog
+      - uses: ./.catalog/.github/actions/k6
+        with:
+          url: ${{ inputs.application-url }}
+          script: ${{ inputs.k6-script }}
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: load-evidence-${{ inputs.environment }}
+          path: artifacts/runtime/
+          if-no-files-found: error
+          retention-days: 30
+
+  dast:
+    name: DAST (ZAP Baseline)
+    needs: smoke-tests
+    if: inputs.enable-zap
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - *catalog
+      - uses: ./.catalog/.github/actions/zap-baseline
+        with:
+          url: ${{ inputs.application-url }}
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dast-evidence-${{ inputs.environment }}
+          path: artifacts/runtime/
+          if-no-files-found: error
+          retention-days: 30
+
+  runtime:
+    name: Deployment Validation Gate
+    needs: [prepare, verify, deploy, wait-sync, smoke-tests, load, dast]
+    if: always() && inputs.validate-deployment && needs.deploy.result == 'success' && needs.deploy.outputs.status != 'stale' && needs.deploy.outputs.revision != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      validated: ${{ steps.complete.outputs.validated }}
+    steps:
+      - *catalog
+      - uses: ./.catalog/.github/actions/pipeline-evidence
+        with:
+          stage-results: ${{ toJSON(needs) }}
+          required-jobs: prepare,verify,deploy,wait-sync,smoke-tests${{ inputs.enable-k6 && ',load' || '' }}${{ inputs.enable-zap && ',dast' || '' }}
+          name: deployment-gate-evidence-${{ inputs.environment }}
+          source-revision: ${{ inputs.source-revision }}
+          image: ${{ inputs.image }}
+          gitops-revision: ${{ needs.deploy.outputs.revision }}
+          configuration: ${{ toJSON(inputs) }}
+      - id: complete
+        run: echo 'validated=true' >> "$GITHUB_OUTPUT"
+
+  rollback:
+    name: Rollback
+    needs: [deploy, wait-sync, smoke-tests, load, dast, runtime]
+    if: >-
+      !cancelled() && inputs.enable-rollback && inputs.validate-deployment &&
+      needs.deploy.result == 'success' && needs.deploy.outputs.status == 'promoted' &&
+      (needs.wait-sync.result == 'failure' || needs.smoke-tests.result == 'failure' ||
+      needs.load.result == 'failure' || needs.dast.result == 'failure' || needs.runtime.result == 'failure')
+    runs-on: ${{ inputs.runner }}
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      status: ${{ steps.complete.outputs.status || steps.restore.outputs.status }}
+      revision: ${{ steps.restore.outputs.revision }}
+    steps:
+      - *catalog
+      - id: restore
+        uses: ./.catalog/.github/actions/promote-gitops
+        with:
+          operation: rollback
+          promotion-revision: ${{ needs.deploy.outputs.revision }}
+          image: ${{ inputs.image }}
+          registry: ${{ inputs.registry }}
+          image-name: ${{ inputs.image-name || github.repository }}
+          registry-username: ${{ inputs.registry-username || github.actor }}
+          registry-token: ${{ secrets.registry-token }}
+          source-revision: ${{ inputs.source-revision }}
+          source-ref: ${{ inputs.source-ref }}
+          signing-identity: ${{ inputs.signing-identity }}
+          repo-url: ${{ inputs.repo-url }}
+          branch: ${{ inputs.branch }}
+          manifest-path: ${{ inputs.manifest-path }}
+          image-key: ${{ inputs.image-key }}
+          username: ${{ inputs.username }}
+          token: ${{ secrets.gitops-token }}
+      - name: Wait for recovery reconciliation
+        if: steps.restore.outputs.status == 'reverted'
+        uses: ./.catalog/.github/actions/argocd-wait
+        with:
+          server: ${{ inputs.argocd-server }}
+          application: ${{ inputs.argocd-application }}
+          revision: ${{ steps.restore.outputs.revision }}
+          image: ${{ steps.restore.outputs.image }}
+          token: ${{ secrets.argocd-token }}
+          ca-file: ${{ inputs.argocd-ca-file }}
+          allow-http: ${{ inputs.argocd-allow-http }}
+      - name: Smoke test restored deployment
+        if: steps.restore.outputs.status == 'reverted'
+        uses: ./.catalog/.github/actions/http-smoke
+        with:
+          url: ${{ inputs.application-url }}
+          health-path: ${{ inputs.health-path }}
+          api-path: ${{ inputs.api-path }}
+          json-kind: ${{ inputs.json-kind }}
+      - id: complete
+        if: steps.restore.outputs.status == 'reverted'
+        run: echo 'status=rolled-back' >> "$GITHUB_OUTPUT"
+      - if: always() && steps.restore.outputs.status == 'reverted'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rollback-evidence-${{ inputs.environment }}
+          path: artifacts/runtime/
+          if-no-files-found: error
+          retention-days: 30
+
+  summary:
+    name: Deployment Summary
+    needs: [prepare, verify, deploy, wait-sync, smoke-tests, load, dast, runtime, rollback]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: mehdihadeli/gha-workflows
+          ref: ${{ inputs.catalog-ref }}
+          path: .catalog
+          persist-credentials: false
+      - uses: ./.catalog/.github/actions/pipeline-evidence
+        with:
+          stage-results: ${{ toJSON(needs) }}
+          source-revision: ${{ inputs.source-revision }}
+          image: ${{ inputs.image }}
+          name: cd-evidence-${{ inputs.environment }}
+          configuration: ${{ toJSON(inputs) }}
+          gitops-revision: ${{ needs.deploy.outputs.revision }}
+      - name: Deployment summary
+        if: always()
+        shell: bash
+        env:
+          STAGES: ${{ toJSON(needs) }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          VERSION: ${{ inputs.version || github.ref_name }}
+          IMAGE: ${{ inputs.image }}
+          SOURCE_REF: ${{ inputs.source-ref }}
+          REVISION: ${{ needs.deploy.outputs.revision }}
+          PROMOTION: ${{ needs.deploy.outputs.status || 'not-run' }}
+          VALIDATED: ${{ needs.runtime.outputs.validated || 'false' }}
+          ROLLBACK: ${{ needs.rollback.outputs.status || 'not-run' }}
+          ROLLBACK_REVISION: ${{ needs.rollback.outputs.revision }}
+        run: |
+          rows="$(jq -r 'to_entries[] | "| " + .key + " | " + (.value.result // "not_run") + " |"' <<< "$STAGES")"
+          {
+            echo '## Deployment Summary'
+            echo
+            echo '| Property | Value |'
+            echo '| --- | --- |'
+            printf '| Environment | %s |\n' "$ENVIRONMENT"
+            printf '| Version | %s |\n' "$VERSION"
+            printf '| Image | %s |\n' "$IMAGE"
+            printf '| Source Ref | %s |\n' "$SOURCE_REF"
+            printf '| GitOps Revision | %s |\n' "$REVISION"
+            printf '| Promotion | %s |\n' "$PROMOTION"
+            printf '| Validated | %s |\n' "$VALIDATED"
+            printf '| Rollback | %s |\n' "$ROLLBACK"
+            printf '| Recovery Revision | %s |\n' "$ROLLBACK_REVISION"
+            echo
+            echo '| Stage | Actual Result |'
+            echo '| --- | --- |'
+            printf '%s\n' "$rows"
+            echo
+            echo 'Recovery never turns a failed candidate into a validated release.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Notify Slack on deployment failure
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          STAGES: ${{ toJSON(needs) }}
+          SLACK_WEBHOOK: ${{ secrets.slack-webhook-url }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          IMAGE: ${{ inputs.image }}
+          ROLLBACK: ${{ needs.rollback.outputs.status || 'not-run' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [[ -z "$SLACK_WEBHOOK" ]] || ! jq -e 'any(.[]; .result == "failure")' <<< "$STAGES" >/dev/null; then
+            exit 0
+          fi
+          [[ "$SLACK_WEBHOOK" == https://hooks.slack.com/services/* ]]
+          payload="$(jq -n --arg environment "$ENVIRONMENT" --arg image "$IMAGE" \
+            --arg rollback "$ROLLBACK" --arg run "$RUN_URL" \
+            '{text: ("Deployment failed in " + $environment + ". Image: " + $image + ". Recovery: " + $rollback + ". " + $run)}')"
+          curl --fail --silent --show-error --connect-timeout 10 --max-time 20 --retry 2 \
+            -H 'Content-Type: application/json' --data "$payload" "$SLACK_WEBHOOK"

@@ -1,0 +1,24 @@
+name: .NET build with analyzers
+description: Build a restored project with warnings and code-style diagnostics enforced.
+inputs:
+  project:
+    description: Restored project or solution path.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      id: build
+      env:
+        PROJECT: ${{ inputs.project }}
+      run: dotnet build "$PROJECT" --configuration Release --no-restore -warnaserror -p:EnforceCodeStyleInBuild=true
+    - name: Record Build Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 🔨 .NET Build
+        tool: .NET SDK
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: build
+        job-status: ${{ job.status }}
+        details: 'Release build with warnings and code-style diagnostics enforced.'

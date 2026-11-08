@@ -1,0 +1,58 @@
+name: Optional Dependency-Track ingestion
+description: Upload a CycloneDX BOM to a configured server; ingestion is not a vulnerability gate.
+inputs:
+  enabled:
+    description: Explicit opt-in.
+    default: 'false'
+  url:
+    description: Dependency-Track base URL.
+    default: ''
+  api-key:
+    description: Scoped BOM-upload API key.
+    required: false
+  bom:
+    description: CycloneDX JSON file.
+    required: true
+  project-name:
+    description: Inventory project name.
+    required: true
+  project-version:
+    description: Immutable application commit or image digest.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      id: ingest
+      env:
+        ENABLED: ${{ inputs.enabled }}
+        URL: ${{ inputs.url }}
+        API_KEY: ${{ inputs.api-key }}
+        BOM: ${{ inputs.bom }}
+        PROJECT_NAME: ${{ inputs.project-name }}
+        PROJECT_VERSION: ${{ inputs.project-version }}
+      run: |
+        if [[ "$ENABLED" != true ]]; then
+          echo '::notice::Dependency-Track ingestion explicitly disabled.'
+          exit 0
+        fi
+        : "${URL:?Dependency-Track URL is required.}"
+        : "${API_KEY:?Dependency-Track API key is required.}"
+        [[ "$URL" == https://* || "$URL" == http://* ]]
+        curl --fail --silent --show-error --max-time 60 \
+          --header "X-Api-Key: $API_KEY" \
+          --form "bom=@$BOM" --form-string "projectName=$PROJECT_NAME" \
+          --form-string "projectVersion=$PROJECT_VERSION" --form-string autoCreate=true \
+          "${URL%/}/api/v1/bom" >/dev/null
+    - name: Record BOM Ingestion Status
+      if: always()
+      uses: ./.catalog/.github/actions/record-status
+      with:
+        title: 📚 Dependency-Track Ingestion
+        tool: Dependency-Track
+        step-results: ${{ toJSON(steps) }}
+        operation-steps: ingest
+        job-status: ${{ job.status }}
+        enabled: ${{ inputs.enabled }}
+        report-only: 'true'
+        details: 'CycloneDX upload acceptance only; ingestion is not a vulnerability gate.'
